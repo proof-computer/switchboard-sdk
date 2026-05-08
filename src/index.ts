@@ -871,6 +871,11 @@ export function createSwitchboardRuntime(options: SwitchboardRuntimeOptions = {}
 
 export const createProofIngressRuntime = createSwitchboardRuntime;
 
+export * from "./network-manifest.js";
+export * from "./report-signing.js";
+export * from "./service-catalog.js";
+export * from "./service-discovery.js";
+
 export function buildSwitchboardChallengeResult(
   config: SwitchboardChallengeConfig,
   request: SwitchboardChallengeRequest
