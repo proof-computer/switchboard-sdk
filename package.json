@@ -1,6 +1,6 @@
 {
   "name": "@proofcomputer/switchboard-sdk",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Runtime SDK for Switchboard Acurast webserver jobs.",
   "repository": {
     "type": "git",

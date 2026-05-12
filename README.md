@@ -8,7 +8,7 @@ published on npmjs.com yet.
 ## Install
 
 ```sh
-npm install github:proof-computer/switchboard-sdk#v0.1.0
+npm install github:proof-computer/switchboard-sdk#v0.1.2
 ```
 
 Framework apps usually install one adapter instead:

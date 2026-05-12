@@ -84,6 +84,14 @@ export interface CertificateRequestPayload {
   deadline: string | bigint | number;
 }
 
+export interface CustomerHostnamePollRequestPayload {
+  sessionId: string;
+  jobSigner: string;
+  endpointHostname: string;
+  nonce: string | bigint | number;
+  deadline: string | bigint | number;
+}
+
 export interface SwitchboardJobSigner {
   getAddress(): Promise<string>;
   signRegistration(input: {
@@ -95,6 +103,11 @@ export interface SwitchboardJobSigner {
     chainId: string | number | bigint;
     registryAddress: string;
     certificateRequest: CertificateRequestPayload;
+  }): Promise<string>;
+  signCustomerHostnamePollRequest?(input: {
+    chainId: string | number | bigint;
+    registryAddress: string;
+    request: CustomerHostnamePollRequestPayload;
   }): Promise<string>;
 }
 
@@ -181,6 +194,48 @@ export interface SwitchboardCertificateResult extends SwitchboardCertificateRela
   };
 }
 
+export interface SwitchboardCustomerHostnamePollRelayRequest {
+  request: CustomerHostnamePollRequestPayload;
+  signature: string;
+}
+
+export interface SwitchboardCustomerHostnameAuthorization {
+  customerHostname: string;
+  endpointHostname: string;
+  sessionId?: string;
+  sessionIds?: string[];
+  developer?: string;
+  status?: string;
+  certificate?: Record<string, unknown>;
+  developerAuthorization?: Record<string, unknown>;
+}
+
+export interface SwitchboardCustomerHostnamePollResponse {
+  ok: boolean;
+  intentId?: string;
+  checkedAt?: string;
+  request?: CustomerHostnamePollRequestPayload;
+  developer?: string;
+  session?: Record<string, unknown>;
+  hostnames?: string[];
+  authorizations?: SwitchboardCustomerHostnameAuthorization[];
+  [key: string]: unknown;
+}
+
+export interface SwitchboardCustomerHostnamePollConfig {
+  relayUrl: string;
+  intentId: string;
+  chainId: string | number | bigint;
+  registryAddress: string;
+  sessionId: string;
+  endpointHostname: string;
+  nonce?: string | number | bigint;
+  deadline?: string | number | bigint;
+  jobSigner?: SwitchboardJobSigner;
+  jobSignerPrivateKey?: string;
+  requestTimeoutMs?: number;
+}
+
 export interface SwitchboardManagedCertificate {
   hostname: string;
   cert: string;
@@ -254,6 +309,7 @@ export interface SwitchboardRuntimeOptions {
 export interface SwitchboardRuntimePrepareResult {
   certificates: SwitchboardManagedCertificate[];
   tlsOptions?: SwitchboardTlsOptions;
+  registration?: SwitchboardRegistrationResult;
 }
 
 export type SwitchboardTlsOptions = SecureContextOptions & {
@@ -329,6 +385,19 @@ export const CERTIFICATE_REQUEST_TYPES: Record<string, Array<{ name: string; typ
   ]
 };
 
+export const CUSTOMER_HOSTNAME_POLL_DOMAIN_NAME = "SwitchboardCustomerHostnamePoll";
+export const CUSTOMER_HOSTNAME_POLL_DOMAIN_VERSION = "1";
+
+export const CUSTOMER_HOSTNAME_POLL_REQUEST_TYPES: Record<string, Array<{ name: string; type: string }>> = {
+  CustomerHostnamePollRequest: [
+    { name: "sessionId", type: "bytes32" },
+    { name: "jobSigner", type: "address" },
+    { name: "endpointHostname", type: "string" },
+    { name: "nonce", type: "uint256" },
+    { name: "deadline", type: "uint256" }
+  ]
+};
+
 export class SwitchboardRuntime {
   readonly deploymentId: string | undefined;
   private readonly env: NodeJS.ProcessEnv;
@@ -336,6 +405,11 @@ export class SwitchboardRuntime {
   private readonly fetchImpl: typeof fetch;
   private readonly runtimeConfig: Record<string, string>;
   private readonly logEvent: (event: string, details?: Record<string, unknown>) => Promise<void>;
+  private readonly managedCertificates: SwitchboardManagedCertificate[] = [];
+  private readonly managedCertificateContexts = new Map<string, SecureContext>();
+  private customerHostnamePollTimer?: NodeJS.Timeout;
+  private customerHostnamePollActive = false;
+  private customerHostnamePollStopped = false;
 
   constructor(options: SwitchboardRuntimeOptions = {}) {
     this.env = options.env ?? process.env;
@@ -429,9 +503,9 @@ export class SwitchboardRuntime {
     }
 
     if (requiredRegistrationEnv().every((name) => this.configValue(name))) {
-      await this.registerIngress(1);
+      const registration = await this.registerIngress(1);
       const certificates = await this.requestCertificates();
-      return { certificates, tlsOptions: tlsOptionsForManagedCertificates(certificates) };
+      return { ...this.prepareManagedCertificateResult(certificates), registration };
     }
 
     return { certificates: [] };
@@ -518,10 +592,10 @@ export class SwitchboardRuntime {
           sessionId: this.sessionId(),
           endpointHostname: this.configValue("ENDPOINT_HOSTNAME")
         });
-        await this.registerIngress(attempt);
+        const registration = await this.registerIngress(attempt);
         await this.reportIntentHealthBestEffort("registered", { sessionId: this.sessionId() });
         const certificates = await this.requestCertificates();
-        return { certificates, tlsOptions: tlsOptionsForManagedCertificates(certificates) };
+        return { ...this.prepareManagedCertificateResult(certificates), registration };
       } catch (error) {
         const willRetry = maxAttempts === 0 || attempt < maxAttempts;
         await this.log("deployment-intent-loop-failed", {
@@ -717,7 +791,7 @@ export class SwitchboardRuntime {
     });
   }
 
-  private async registerIngress(attempt: number): Promise<void> {
+  private async registerIngress(attempt: number): Promise<SwitchboardRegistrationResult> {
     const signer = await this.jobSigner();
     await this.reportIntentHealth("registering", { attempt }).catch(() => undefined);
     const result = await registerIngressWithRelay({
@@ -739,13 +813,13 @@ export class SwitchboardRuntime {
       signerMode: signer.mode,
       relayResponse: sanitizeRelayResponse(result.relayResponse)
     });
+    return result;
   }
 
-  private async requestCertificates(): Promise<SwitchboardManagedCertificate[]> {
+  private async requestCertificates(hostnames = this.certificateHostnames()): Promise<SwitchboardManagedCertificate[]> {
     if (this.configValue("SWITCHBOARD_CERTIFICATE_MODE") !== "job-acme") {
       return [];
     }
-    const hostnames = this.certificateHostnames();
     if (hostnames.length === 0) {
       throw new SwitchboardCertificateError("Switchboard job-acme certificate request has no certificate hostnames", {
         stage: "hostname_config"
@@ -844,6 +918,169 @@ export class SwitchboardRuntime {
     }
 
     return [];
+  }
+
+  private prepareManagedCertificateResult(certificates: SwitchboardManagedCertificate[]): SwitchboardRuntimePrepareResult {
+    this.replaceManagedCertificates(certificates);
+    this.startCustomerHostnamePolling();
+    return {
+      certificates: this.managedCertificates,
+      tlsOptions: this.tlsOptionsForManagedCertificates()
+    };
+  }
+
+  private replaceManagedCertificates(certificates: SwitchboardManagedCertificate[]): void {
+    this.managedCertificates.splice(0, this.managedCertificates.length);
+    this.managedCertificateContexts.clear();
+    for (const certificate of certificates) {
+      this.addManagedCertificate(certificate);
+    }
+  }
+
+  private addManagedCertificate(certificate: SwitchboardManagedCertificate): boolean {
+    const hostname = normalizeHostname(certificate.hostname);
+    const existingIndex = this.managedCertificates.findIndex((item) => normalizeHostname(item.hostname) === hostname);
+    if (existingIndex >= 0) {
+      this.managedCertificates[existingIndex] = certificate;
+    } else {
+      this.managedCertificates.push(certificate);
+    }
+    this.managedCertificateContexts.set(
+      hostname,
+      tls.createSecureContext({
+        cert: certificate.cert,
+        key: certificate.key
+      })
+    );
+    return existingIndex < 0;
+  }
+
+  private tlsOptionsForManagedCertificates(): SwitchboardTlsOptions | undefined {
+    if (this.managedCertificates.length === 0) {
+      return undefined;
+    }
+    const defaultCertificate = this.managedCertificates[0]!;
+    return {
+      cert: defaultCertificate.cert,
+      key: defaultCertificate.key,
+      SNICallback: (servername, callback) => {
+        const context =
+          this.managedCertificateContexts.get(normalizeHostname(servername)) ??
+          this.managedCertificateContexts.get(normalizeHostname(defaultCertificate.hostname));
+        if (!context) {
+          callback(new Error("No TLS context available"));
+          return;
+        }
+        callback(null, context);
+      }
+    };
+  }
+
+  private startCustomerHostnamePolling(): void {
+    if (this.customerHostnamePollTimer || this.customerHostnamePollStopped) {
+      return;
+    }
+    if (this.configValue("SWITCHBOARD_CERTIFICATE_MODE") !== "job-acme") {
+      return;
+    }
+    if (
+      !this.configValue("SWITCHBOARD_INTENT_ID") ||
+      !(this.configValue("SWITCHBOARD_RELAY_URL") ?? this.configValue("RELAY_URL")) ||
+      !this.configValue("ENDPOINT_HOSTNAME")
+    ) {
+      return;
+    }
+    const durationMs = numberConfig(this, "SWITCHBOARD_CUSTOMER_HOSTNAME_POLL_DURATION_MS", 15 * 60_000);
+    if (durationMs <= 0) {
+      return;
+    }
+    const intervalMs = Math.max(1_000, numberConfig(this, "SWITCHBOARD_CUSTOMER_HOSTNAME_POLL_MS", 10_000));
+    const deadlineMs = Date.now() + durationMs;
+    const tick = () => {
+      if (Date.now() >= deadlineMs) {
+        this.stopCustomerHostnamePolling();
+        return;
+      }
+      void this.pollCustomerHostnameAuthorizationsOnce().then((issued) => {
+        if (issued && this.configValue("SWITCHBOARD_CUSTOMER_HOSTNAME_POLL_STOP_AFTER_SUCCESS") !== "false") {
+          this.stopCustomerHostnamePolling();
+        }
+      });
+    };
+    void this.log("customer-hostname-poll-started", { intervalMs, durationMs }).catch(() => undefined);
+    this.customerHostnamePollTimer = setInterval(tick, intervalMs);
+    this.customerHostnamePollTimer.unref();
+    tick();
+  }
+
+  private stopCustomerHostnamePolling(): void {
+    if (this.customerHostnamePollTimer) {
+      clearInterval(this.customerHostnamePollTimer);
+      this.customerHostnamePollTimer = undefined;
+    }
+    this.customerHostnamePollStopped = true;
+  }
+
+  private async pollCustomerHostnameAuthorizationsOnce(): Promise<boolean> {
+    if (this.customerHostnamePollActive) {
+      return false;
+    }
+    this.customerHostnamePollActive = true;
+    try {
+      const relayUrl = this.configValue("SWITCHBOARD_RELAY_URL") ?? this.configValue("RELAY_URL");
+      const intentId = this.configValue("SWITCHBOARD_INTENT_ID");
+      const endpointHostname = this.configValue("ENDPOINT_HOSTNAME");
+      if (!relayUrl || !intentId || !endpointHostname) {
+        return false;
+      }
+      const signer = await this.jobSigner();
+      const jobSigner = signer.signer;
+      if (typeof jobSigner.signCustomerHostnamePollRequest !== "function") {
+        await this.log("customer-hostname-poll-skipped", {
+          reason: "job-signer-does-not-support-customer-hostname-poll"
+        }).catch(() => undefined);
+        this.stopCustomerHostnamePolling();
+        return false;
+      }
+      const response = await pollCustomerHostnameAuthorizationsWithRelay({
+        relayUrl,
+        intentId,
+        chainId: this.requiredConfig("CHAIN_ID"),
+        registryAddress: this.requiredConfig("INGRESS_REGISTRY_ADDRESS"),
+        sessionId: this.requiredConfig("SESSION_ID"),
+        endpointHostname,
+        jobSigner,
+        requestTimeoutMs: numberConfig(this, "SWITCHBOARD_CUSTOMER_HOSTNAME_POLL_TIMEOUT_MS", this.intentRequestTimeoutMs())
+      }, this.fetchImpl);
+      const hostnames = customerHostnamePollHostnames(response)
+        .map(normalizeHostname)
+        .filter((hostname) => !this.managedCertificateContexts.has(hostname));
+      if (hostnames.length === 0) {
+        return false;
+      }
+      await this.log("customer-hostname-certificate-requesting", { hostnames }).catch(() => undefined);
+      const certificates = await this.requestCertificates(hostnames);
+      for (const certificate of certificates) {
+        this.addManagedCertificate(certificate);
+      }
+      this.setRuntimeConfig({
+        SWITCHBOARD_CERTIFICATE_HOSTNAMES: this.managedCertificates.map((certificate) => certificate.hostname).join(",")
+      });
+      await this.log("customer-hostname-certificates-issued", {
+        hostnames: certificates.map((certificate) => certificate.hostname),
+        certificates: certificates.map((certificate) => ({
+          hostname: certificate.hostname,
+          issuer: certificate.issuer,
+          notAfter: certificate.notAfter
+        }))
+      }).catch(() => undefined);
+      return certificates.length > 0;
+    } catch (error) {
+      await this.log("customer-hostname-poll-failed", { error: safeError(error) }).catch(() => undefined);
+      return false;
+    } finally {
+      this.customerHostnamePollActive = false;
+    }
   }
 
   private certificateHostnames(): string[] {
@@ -1012,6 +1249,66 @@ export function certificateRequestDigest(
   );
 }
 
+export function customerHostnamePollRequestDomain(chainId: bigint | number | string, verifyingContract: string) {
+  return {
+    name: CUSTOMER_HOSTNAME_POLL_DOMAIN_NAME,
+    version: CUSTOMER_HOSTNAME_POLL_DOMAIN_VERSION,
+    chainId,
+    verifyingContract
+  };
+}
+
+export function normalizeCustomerHostnamePollRequest(
+  request: CustomerHostnamePollRequestPayload
+): CustomerHostnamePollRequestPayload {
+  return {
+    sessionId: ethers.hexlify(request.sessionId),
+    jobSigner: ethers.getAddress(request.jobSigner),
+    endpointHostname: normalizeHostname(request.endpointHostname),
+    nonce: request.nonce.toString(),
+    deadline: request.deadline.toString()
+  };
+}
+
+export function customerHostnamePollRequestDigest(
+  chainId: bigint | number | string,
+  verifyingContract: string,
+  request: CustomerHostnamePollRequestPayload
+): string {
+  return ethers.TypedDataEncoder.hash(
+    customerHostnamePollRequestDomain(chainId, verifyingContract),
+    CUSTOMER_HOSTNAME_POLL_REQUEST_TYPES,
+    normalizeCustomerHostnamePollRequest(request)
+  );
+}
+
+export async function signCustomerHostnamePollRequest(
+  wallet: ethers.Wallet,
+  chainId: bigint | number | string,
+  verifyingContract: string,
+  request: CustomerHostnamePollRequestPayload
+): Promise<string> {
+  return wallet.signTypedData(
+    customerHostnamePollRequestDomain(chainId, verifyingContract),
+    CUSTOMER_HOSTNAME_POLL_REQUEST_TYPES,
+    normalizeCustomerHostnamePollRequest(request)
+  );
+}
+
+export function recoverCustomerHostnamePollRequestSigner(
+  chainId: bigint | number | string,
+  verifyingContract: string,
+  request: CustomerHostnamePollRequestPayload,
+  signature: string
+): string {
+  return ethers.verifyTypedData(
+    customerHostnamePollRequestDomain(chainId, verifyingContract),
+    CUSTOMER_HOSTNAME_POLL_REQUEST_TYPES,
+    normalizeCustomerHostnamePollRequest(request),
+    signature
+  );
+}
+
 export async function signCertificateRequest(
   wallet: ethers.Wallet,
   chainId: bigint | number | string,
@@ -1036,6 +1333,9 @@ export function privateKeyJobSigner(privateKey: string): SwitchboardJobSigner {
     },
     async signCertificateRequest(input) {
       return signCertificateRequest(wallet, input.chainId, input.registryAddress, input.certificateRequest);
+    },
+    async signCustomerHostnamePollRequest(input) {
+      return signCustomerHostnamePollRequest(wallet, input.chainId, input.registryAddress, input.request);
     }
   };
 }
@@ -1072,6 +1372,10 @@ export function acurastJobSigner(
     },
     async signCertificateRequest(input) {
       const digest = certificateRequestDigest(input.chainId, input.registryAddress, input.certificateRequest);
+      return signAcurastSecp256k1Digest(sign, digest, await getAddress(), std);
+    },
+    async signCustomerHostnamePollRequest(input) {
+      const digest = customerHostnamePollRequestDigest(input.chainId, input.registryAddress, input.request);
       return signAcurastSecp256k1Digest(sign, digest, await getAddress(), std);
     }
   };
@@ -1190,6 +1494,49 @@ export async function requestCertificateWithRelay(
     );
   }
   return { ...request, relayResponse };
+}
+
+export async function buildCustomerHostnamePollRequest(
+  config: SwitchboardCustomerHostnamePollConfig
+): Promise<SwitchboardCustomerHostnamePollRelayRequest> {
+  const jobSigner = config.jobSigner ?? localJobSigner(config.jobSignerPrivateKey);
+  if (typeof jobSigner.signCustomerHostnamePollRequest !== "function") {
+    throw new Error("Switchboard job signer does not support customer hostname polling signatures");
+  }
+  const request: CustomerHostnamePollRequestPayload = normalizeCustomerHostnamePollRequest({
+    sessionId: config.sessionId,
+    jobSigner: await jobSigner.getAddress(),
+    endpointHostname: config.endpointHostname,
+    nonce: config.nonce ?? Date.now(),
+    deadline: config.deadline ?? Math.floor(Date.now() / 1000) + 600
+  });
+  const signature = await jobSigner.signCustomerHostnamePollRequest({
+    chainId: config.chainId,
+    registryAddress: config.registryAddress,
+    request
+  });
+  return { request, signature };
+}
+
+export async function pollCustomerHostnameAuthorizationsWithRelay(
+  config: SwitchboardCustomerHostnamePollConfig,
+  fetchImpl: typeof fetch = fetch
+): Promise<SwitchboardCustomerHostnamePollResponse> {
+  const request = await buildCustomerHostnamePollRequest(config);
+  const response = await fetchImpl(
+    new URL(`/v1/deployment-intents/${encodeURIComponent(config.intentId)}/customer-hostname-authorizations`, config.relayUrl),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      signal: AbortSignal.timeout(config.requestTimeoutMs ?? 60_000),
+      body: JSON.stringify(request)
+    }
+  );
+  const relayResponse = await responseJsonOrText(response) as SwitchboardCustomerHostnamePollResponse;
+  if (!response.ok) {
+    throw new Error(`Relay customer hostname authorization poll failed: ${response.status} ${JSON.stringify(relayResponse)}`);
+  }
+  return relayResponse;
 }
 
 export function createEncryptedSwitchboardLogger(
@@ -1749,6 +2096,16 @@ function splitCsv(value: string): string[] {
 
 function normalizeHostname(hostname: string): string {
   return hostname.trim().replace(/\.$/, "").toLowerCase();
+}
+
+function customerHostnamePollHostnames(response: SwitchboardCustomerHostnamePollResponse): string[] {
+  const direct = Array.isArray(response.hostnames) ? response.hostnames : [];
+  const fromAuthorizations = Array.isArray(response.authorizations)
+    ? response.authorizations.map((authorization) => authorization.customerHostname)
+    : [];
+  return [...new Set([...direct, ...fromAuthorizations].filter((hostname): hostname is string =>
+    typeof hostname === "string" && hostname.length > 0
+  ))];
 }
 
 function sleep(ms: number): Promise<void> {
