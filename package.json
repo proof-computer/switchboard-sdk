@@ -1,6 +1,6 @@
 {
   "name": "@proofcomputer/switchboard-sdk",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Runtime SDK for Switchboard Acurast webserver jobs.",
   "repository": {
     "type": "git",
@@ -13,6 +13,18 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./control-plane": {
+      "types": "./dist/control-plane.d.ts",
+      "import": "./dist/control-plane.js"
+    },
+    "./funding": {
+      "types": "./dist/funding.d.ts",
+      "import": "./dist/funding.js"
+    },
+    "./workflows": {
+      "types": "./dist/workflows.d.ts",
+      "import": "./dist/workflows.js"
     }
   },
   "files": [
@@ -21,6 +33,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "test": "npm run build && node --test tests/*.test.mjs",
     "prepare": "npm run build",
     "pack:dry-run": "npm pack --dry-run --json"
   },
