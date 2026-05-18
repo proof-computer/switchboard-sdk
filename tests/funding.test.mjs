@@ -1,11 +1,17 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { ethers } from "ethers";
 
 import {
   assertQuoteWithinCap,
   buildHubFundingActionPlan,
+  deriveIngressSessionId,
+  endpointHash,
+  hashIngressQuote,
   normalizeIngressQuote,
-  quoteResponseFromDeploymentIntentStatus
+  quoteResponseFromDeploymentIntentStatus,
+  rebindIngressQuoteEndpoint,
+  signIngressQuote
 } from "../dist/funding.js";
 
 const developer = "0x4000000000000000000000000000000000000004";
@@ -106,5 +112,47 @@ describe("Switchboard SDK funding helpers", () => {
     assert.deepEqual(plan.actions.map((action) => action.id), ["mapAccount", "approve", "fundWithAssetQuote"]);
     assert.match(plan.actions[1].calldata, /^0x/);
     assert.equal(plan.actions[2].to, "0x9000000000000000000000000000000000000009");
+  });
+
+  it("rebinds and signs a quote for an ops-owned canonical endpoint", () => {
+    const hostname = "relay-d.switchboard.proof.computer";
+    const registryAddress = "0x9000000000000000000000000000000000000009";
+    const quoteSignerPrivateKey = "0x0000000000000000000000000000000000000000000000000000000000000007";
+    const rebound = rebindIngressQuoteEndpoint({
+      quote,
+      chainId: "420420419",
+      registryAddress,
+      endpointHostname: hostname,
+      sessionLabel: "switchboard-relay-d",
+      policy: {
+        unit: "active_endpoint_minute",
+        endpoint: { mode: "control-plane-canonical", hostname: "old.example" }
+      }
+    });
+    const signature = signIngressQuote(rebound, { chainId: "420420419", registryAddress }, quoteSignerPrivateKey);
+    const signer = ethers.recoverAddress(hashIngressQuote(rebound, { chainId: "420420419", registryAddress }), signature);
+
+    assert.equal(rebound.endpointHash, endpointHash(hostname));
+    assert.notEqual(rebound.sessionId, quote.sessionId);
+    assert.notEqual(rebound.policyHash, quote.policyHash);
+    assert.equal(signer, new ethers.Wallet(quoteSignerPrivateKey).address);
+  });
+
+  it("derives session ids with the deployed registry domain", () => {
+    assert.equal(
+      deriveIngressSessionId({
+        chainId: "420420419",
+        registryAddress: "0x9000000000000000000000000000000000000009",
+        developerAddress: developer,
+        assetAddress: asset,
+        jobId: quote.jobId,
+        expectedJobSigner: quote.expectedJobSigner,
+        operatorId: quote.operatorId,
+        processorId: quote.processorId,
+        endpointHash: quote.endpointHash,
+        salt: quote.salt
+      }),
+      "0x557e2d0bb185b26625d160e66ec9be496e39bd1cd3dfb32c999a503390e106fe"
+    );
   });
 });

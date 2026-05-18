@@ -631,15 +631,15 @@ export class SwitchboardRuntime {
   }
 
   private async jobSigner(): Promise<{ signer: SwitchboardJobSigner; mode: string }> {
-    const acurastSigner = maybeAcurastJobSigner(this.std);
-    if (acurastSigner) {
-      return { signer: acurastSigner, mode: "acurast-secp256k1" };
-    }
     const privateKey = this.configValue("JOB_SIGNER_PRIVATE_KEY");
     if (privateKey) {
       return { signer: privateKeyJobSigner(privateKey), mode: "private-key" };
     }
-    throw new Error("Missing Acurast secp256k1 runtime signer and JOB_SIGNER_PRIVATE_KEY fallback");
+    const acurastSigner = maybeAcurastJobSigner(this.std);
+    if (acurastSigner) {
+      return { signer: acurastSigner, mode: "acurast-secp256k1" };
+    }
+    throw new Error("Missing JOB_SIGNER_PRIVATE_KEY and Acurast secp256k1 runtime signer");
   }
 
   private async claimIntent(input: {
@@ -1703,15 +1703,19 @@ export function acurastDeploymentSequence(value: string | undefined): string | u
 }
 
 export function publicNetworkAddresses(): string[] {
-  return [
-    ...new Set(
-      Object.values(networkInterfaces())
-        .flatMap((values) => values ?? [])
-        .filter((item) => item.internal === false && String(item.family) === "IPv4")
-        .map((item) => item.address)
-        .filter((value): value is string => typeof value === "string" && value.length > 0)
-    )
-  ];
+  try {
+    return [
+      ...new Set(
+        Object.values(networkInterfaces())
+          .flatMap((values) => values ?? [])
+          .filter((item) => item.internal === false && String(item.family) === "IPv4")
+          .map((item) => item.address)
+          .filter((value): value is string => typeof value === "string" && value.length > 0)
+      )
+    ];
+  } catch {
+    return [];
+  }
 }
 
 export function allowAcurastHostname(rawUrl: string, std: AcurastRuntimeStd | undefined = (globalThis as { _STD_?: AcurastRuntimeStd })._STD_): void {
@@ -1733,11 +1737,11 @@ export function allowAcurastHostname(rawUrl: string, std: AcurastRuntimeStd | un
 }
 
 function localJobSigner(privateKey: string | undefined): SwitchboardJobSigner {
-  const acurastSigner = maybeAcurastJobSigner();
-  if (acurastSigner) {
-    return acurastSigner;
-  }
   if (!privateKey) {
+    const acurastSigner = maybeAcurastJobSigner();
+    if (acurastSigner) {
+      return acurastSigner;
+    }
     throw new Error("JOB_SIGNER_PRIVATE_KEY is required outside the Acurast runtime.");
   }
   return privateKeyJobSigner(privateKey);

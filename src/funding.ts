@@ -60,6 +60,37 @@ export interface IngressQuote {
   deadline: bigint;
 }
 
+export interface BuildIngressQuoteInput {
+  chainId: bigint | number | string;
+  registryAddress: string;
+  developer: string;
+  asset: string;
+  amount?: bigint;
+  serviceAmount?: bigint;
+  setupFee?: bigint;
+  validationFeeCap?: bigint;
+  minAmount?: bigint;
+  maxAmount?: bigint;
+  paidSeconds: bigint;
+  expectedJobSigner: string;
+  operatorRecipient: string;
+  validatorRecipient: string;
+  proofRecipient: string;
+  maxOperatorBps?: number;
+  maxValidatorBps?: number;
+  maxProofBps?: number;
+  policyHash: string;
+  deadline: bigint | number | string;
+  quoteId?: string;
+  sessionLabel?: string;
+  jobId?: string;
+  operatorId?: string;
+  processorId?: string;
+  endpointHostname?: string;
+  endpointHash?: string;
+  salt?: string;
+}
+
 export interface SerializedIngressQuote extends Omit<IngressQuote,
   "amount" | "minAmount" | "maxAmount" | "paidSeconds" | "serviceAmount" | "setupFee" | "validationFeeCap" | "deadline"> {
   amount: string;
@@ -84,6 +115,16 @@ export interface IngressQuoteBindingRequest {
   endpointHash?: string;
   endpointHostname?: string;
   salt?: string;
+}
+
+export interface RebindIngressQuoteEndpointInput {
+  quote: IngressQuote | Record<string, unknown>;
+  chainId: bigint | number | string;
+  registryAddress: string;
+  endpointHostname?: string;
+  endpointHash?: string;
+  sessionLabel?: string;
+  policy?: unknown;
 }
 
 export interface QuoteResponse {
@@ -225,6 +266,82 @@ export function serializeIngressQuote(quote: IngressQuote): SerializedIngressQuo
   };
 }
 
+export function buildIngressQuote(input: BuildIngressQuoteInput): IngressQuote {
+  const setupFee = input.setupFee ?? 0n;
+  const validationFeeCap = input.validationFeeCap ?? 0n;
+  const serviceAmount = input.serviceAmount ?? input.amount;
+  if (serviceAmount === undefined) {
+    throw new Error("quote serviceAmount must be provided");
+  }
+  const amount = input.amount ?? serviceAmount + setupFee + validationFeeCap;
+  if (setupFee < 0n || validationFeeCap < 0n) {
+    throw new Error("quote fees cannot be negative");
+  }
+  if (amount <= 0n || serviceAmount <= 0n || amount !== serviceAmount + setupFee + validationFeeCap) {
+    throw new Error("quote amount must equal serviceAmount plus fee caps");
+  }
+  if (input.paidSeconds <= 0n) {
+    throw new Error("quote paidSeconds must be positive");
+  }
+  if (input.paidSeconds > MAX_INGRESS_QUOTE_PAID_SECONDS) {
+    throw new Error("quote paidSeconds exceeds the 28 day Acurast job maximum");
+  }
+
+  const sessionLabel = input.sessionLabel ?? `ingress-${Date.now()}`;
+  const asset = ethers.getAddress(input.asset);
+  if (asset === ethers.ZeroAddress) {
+    throw new Error("quote asset must be a non-native ERC20 address");
+  }
+  const developer = ethers.getAddress(input.developer);
+  const expectedJobSigner = ethers.getAddress(input.expectedJobSigner);
+  const endpointHostname = input.endpointHostname ?? `${toDnsLabel(sessionLabel)}.ingress.test`;
+  const endpointHashValue = input.endpointHash ? ethers.hexlify(input.endpointHash) : endpointHash(endpointHostname);
+  const jobId = input.jobId ?? idBytes32(`${sessionLabel}:job`);
+  const operatorId = input.operatorId ?? idBytes32("proof-operator-local");
+  const processorId = input.processorId ?? idBytes32("processor-local-1");
+  const salt = input.salt ?? idBytes32(`${sessionLabel}:session`);
+  const sessionId = deriveIngressSessionId({
+    chainId: input.chainId,
+    registryAddress: input.registryAddress,
+    developerAddress: developer,
+    assetAddress: asset,
+    jobId,
+    expectedJobSigner,
+    operatorId,
+    processorId,
+    endpointHash: endpointHashValue,
+    salt
+  });
+
+  return {
+    quoteId: input.quoteId ?? ethers.hexlify(ethers.randomBytes(32)),
+    sessionId,
+    developer,
+    asset,
+    amount,
+    minAmount: input.minAmount ?? amount,
+    maxAmount: input.maxAmount ?? amount,
+    paidSeconds: input.paidSeconds,
+    serviceAmount,
+    setupFee,
+    validationFeeCap,
+    jobId,
+    expectedJobSigner,
+    operatorId,
+    processorId,
+    endpointHash: endpointHashValue,
+    salt,
+    operatorRecipient: ethers.getAddress(input.operatorRecipient),
+    validatorRecipient: ethers.getAddress(input.validatorRecipient),
+    proofRecipient: ethers.getAddress(input.proofRecipient),
+    maxOperatorBps: input.maxOperatorBps ?? 8_000,
+    maxValidatorBps: input.maxValidatorBps ?? 500,
+    maxProofBps: input.maxProofBps ?? 2_000,
+    policyHash: ethers.hexlify(input.policyHash),
+    deadline: BigInt(input.deadline)
+  };
+}
+
 export function ingressQuoteToContractTuple(quote: IngressQuote) {
   return {
     quoteId: quote.quoteId,
@@ -311,6 +428,14 @@ export function hashIngressQuote(
   return ethers.keccak256(ethers.concat(["0x1901", domainSeparator, structHash]));
 }
 
+export function signIngressQuote(
+  quote: IngressQuote,
+  domain: { chainId: bigint | number | string; registryAddress: string },
+  quoteSignerPrivateKey: string
+): string {
+  return new ethers.Wallet(quoteSignerPrivateKey).signingKey.sign(hashIngressQuote(quote, domain)).serialized;
+}
+
 export function assertIngressQuoteMatchesRequest(quote: IngressQuote, request: IngressQuoteBindingRequest): void {
   const developer = ethers.getAddress(request.developer);
   const asset = ethers.getAddress(request.asset);
@@ -348,6 +473,56 @@ export function assertIngressQuoteMatchesRequest(quote: IngressQuote, request: I
       throw new Error(`Quote endpointHash ${quote.endpointHash} does not match requested endpoint hostname ${request.endpointHostname}`);
     }
   }
+}
+
+export function rebindIngressQuoteEndpoint(input: RebindIngressQuoteEndpointInput): IngressQuote {
+  const quote = "amount" in input.quote && typeof input.quote.amount === "bigint"
+    ? input.quote as IngressQuote
+    : normalizeIngressQuote(input.quote as Record<string, unknown>);
+  if (!input.endpointHostname && !input.endpointHash) {
+    return quote;
+  }
+  const policy = input.policy === undefined
+    ? undefined
+    : rebindIngressQuotePolicyEndpoint(input.policy, {
+        endpointHostname: input.endpointHostname,
+        endpointHash: input.endpointHash
+      });
+
+  return buildIngressQuote({
+    chainId: input.chainId,
+    registryAddress: input.registryAddress,
+    developer: quote.developer,
+    asset: quote.asset,
+    amount: quote.amount,
+    minAmount: quote.minAmount,
+    maxAmount: quote.maxAmount,
+    paidSeconds: quote.paidSeconds,
+    serviceAmount: quote.serviceAmount,
+    setupFee: quote.setupFee,
+    validationFeeCap: quote.validationFeeCap,
+    expectedJobSigner: quote.expectedJobSigner,
+    operatorRecipient: quote.operatorRecipient,
+    validatorRecipient: quote.validatorRecipient,
+    proofRecipient: quote.proofRecipient,
+    maxOperatorBps: quote.maxOperatorBps,
+    maxValidatorBps: quote.maxValidatorBps,
+    maxProofBps: quote.maxProofBps,
+    policyHash: policy === undefined ? quote.policyHash : policyHashFromJson(policy),
+    deadline: quote.deadline,
+    quoteId: quote.quoteId,
+    sessionLabel: input.sessionLabel,
+    jobId: quote.jobId,
+    operatorId: quote.operatorId,
+    processorId: quote.processorId,
+    endpointHostname: input.endpointHostname,
+    endpointHash: input.endpointHash,
+    salt: quote.salt
+  });
+}
+
+export function policyHashFromJson(value: unknown): string {
+  return ethers.keccak256(ethers.toUtf8Bytes(stableJson(value)));
 }
 
 export function assertQuoteWithinCap(quote: IngressQuote, capAmount: string | bigint | number | undefined): void {
@@ -575,7 +750,7 @@ export function deriveIngressSessionId(input: {
     ethers.AbiCoder.defaultAbiCoder().encode(
       ["bytes32", "uint256", "address", "address", "address", "bytes32", "address", "bytes32", "bytes32", "bytes32", "bytes32"],
       [
-        idBytes32("SWITCHBOARD_SESSION_V1"),
+        idBytes32("PROOF_INGRESS_SESSION_V1"),
         input.chainId,
         ethers.getAddress(input.registryAddress),
         ethers.getAddress(input.developerAddress),
@@ -740,6 +915,38 @@ function stringField(input: unknown, name: string): string | undefined {
 
 function compactObject(input: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(Object.entries(input).filter(([, value]) => value !== undefined && value !== ""));
+}
+
+function rebindIngressQuotePolicyEndpoint(
+  policy: unknown,
+  input: { endpointHostname?: string; endpointHash?: string }
+): unknown {
+  if (!policy || typeof policy !== "object" || Array.isArray(policy)) return policy;
+  const next: Record<string, unknown> = { ...(policy as Record<string, unknown>) };
+  const existingEndpoint = objectField(next, "endpoint");
+  const endpoint = existingEndpoint ? { ...existingEndpoint } : {};
+  if (input.endpointHostname) endpoint.hostname = input.endpointHostname;
+  if (input.endpointHash) endpoint.endpointHash = normalizeBytes32(input.endpointHash, "requested endpointHash");
+  next.endpoint = endpoint;
+  return next;
+}
+
+function stableJson(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableJson(item)).join(",")}]`;
+  }
+  return `{${Object.keys(value as Record<string, unknown>)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${stableJson((value as Record<string, unknown>)[key])}`)
+    .join(",")}}`;
+}
+
+function toDnsLabel(value: string): string {
+  const label = value.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
+  return label.length > 0 ? label.slice(0, 63) : "ingress";
 }
 
 function isTimeoutError(error: unknown): boolean {
