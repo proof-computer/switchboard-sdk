@@ -48,6 +48,22 @@ describe("SwitchboardDeployWorkflow", () => {
     assert.equal(report.quote.quote.sessionId, `0x${"22".repeat(32)}`);
   });
 
+  it("passes intent tokens to protected single-intent workflow calls", async () => {
+    const protectedCalls = [];
+    const workflow = new SwitchboardDeployWorkflow(input, fakeAdapters({ protectedCalls }));
+
+    const snapshot = await workflow.runToBlocked();
+
+    assert.equal(snapshot.step, "complete");
+    assert.deepEqual(protectedCalls, [
+      { method: "updateDeploymentIntentDeployment", id: "di_test", cliToken: "cli-token" },
+      { method: "readDeploymentIntent", id: "di_test", cliToken: "cli-token" },
+      { method: "refreshDeploymentIntentFunding", id: "di_test", cliToken: "cli-token" },
+      { method: "refreshDeploymentIntentRoute", id: "di_test", cliToken: "cli-token" },
+      { method: "readDeploymentIntent", id: "di_test", cliToken: "cli-token" }
+    ]);
+  });
+
   it("pauses on off-process funding and resumes from a redacted receipt", async () => {
     const workflow = new SwitchboardDeployWorkflow(input, fakeAdapters({ requireFundingAction: true }));
     const blocked = await workflow.runToBlocked();
@@ -408,13 +424,28 @@ function fakeAdapters(options = {}) {
           }
         };
       },
-      async updateDeploymentIntentGroupDeployment() {
+      async updateDeploymentIntentGroupDeployment(groupId, _input, requestOptions) {
+        options.protectedCalls?.push({
+          method: "updateDeploymentIntentGroupDeployment",
+          id: groupId,
+          cliToken: requestOptions?.cliToken
+        });
         return { ok: true };
       },
-      async updateDeploymentIntentDeployment() {
+      async updateDeploymentIntentDeployment(intentId, _input, requestOptions) {
+        options.protectedCalls?.push({
+          method: "updateDeploymentIntentDeployment",
+          id: intentId,
+          cliToken: requestOptions?.cliToken
+        });
         return { ok: true };
       },
-      async readDeploymentIntent() {
+      async readDeploymentIntent(intentId, requestOptions) {
+        options.protectedCalls?.push({
+          method: "readDeploymentIntent",
+          id: intentId,
+          cliToken: requestOptions?.cliToken
+        });
         runtimeReadCount += 1;
         if (options.runtimeClaimsAfter && runtimeReadCount < options.runtimeClaimsAfter) {
           return {
@@ -435,7 +466,12 @@ function fakeAdapters(options = {}) {
           }
         };
       },
-      async refreshDeploymentIntentFunding() {
+      async refreshDeploymentIntentFunding(intentId, requestOptions) {
+        options.protectedCalls?.push({
+          method: "refreshDeploymentIntentFunding",
+          id: intentId,
+          cliToken: requestOptions?.cliToken
+        });
         return {
           ok: true,
           intent: {
@@ -454,7 +490,12 @@ function fakeAdapters(options = {}) {
           }
         };
       },
-      async refreshDeploymentIntentRoute() {
+      async refreshDeploymentIntentRoute(intentId, requestOptions) {
+        options.protectedCalls?.push({
+          method: "refreshDeploymentIntentRoute",
+          id: intentId,
+          cliToken: requestOptions?.cliToken
+        });
         return { ok: true, route: { status: "active", hostname: "e-test.acurast.ingress.works" } };
       },
       async refreshDeploymentIntentGroupMemberRoute(_groupId, intentId) {

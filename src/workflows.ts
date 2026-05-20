@@ -529,16 +529,22 @@ export class SwitchboardDeployWorkflow {
     }
     this.snapshotValue.data.deployment = result;
     if (deploymentIntentGroup) {
-      await this.adapters.controlPlane.updateDeploymentIntentGroupDeployment(deploymentIntentGroup.groupId, result as any);
+      await this.adapters.controlPlane.updateDeploymentIntentGroupDeployment(deploymentIntentGroup.groupId, result as any, {
+        cliToken: deploymentIntentGroup.cliToken
+      });
     } else if (deploymentIntent) {
-      await this.adapters.controlPlane.updateDeploymentIntentDeployment(deploymentIntent.intentId, result as any);
+      await this.adapters.controlPlane.updateDeploymentIntentDeployment(deploymentIntent.intentId, result as any, {
+        cliToken: deploymentIntent.cliToken
+      });
     }
     this.transition("deploy_submitted", "deploy_submitted", result);
   }
 
   private async observeRuntime(): Promise<void> {
     const deploymentIntent = this.deploymentIntent();
-    const status = await this.adapters.controlPlane.readDeploymentIntent(deploymentIntent.intentId);
+    const status = await this.adapters.controlPlane.readDeploymentIntent(deploymentIntent.intentId, {
+      cliToken: deploymentIntent.cliToken
+    });
     const intent = recordValue(status.intent);
     const runtimeSigner = stringValue(intent.runtimeSigner);
     if (!runtimeSigner) return;
@@ -718,7 +724,9 @@ export class SwitchboardDeployWorkflow {
 
   private async refreshFundingAndDns(): Promise<void> {
     const deploymentIntent = this.deploymentIntent();
-    const status = await this.adapters.controlPlane.refreshDeploymentIntentFunding(deploymentIntent.intentId);
+    const status = await this.adapters.controlPlane.refreshDeploymentIntentFunding(deploymentIntent.intentId, {
+      cliToken: deploymentIntent.cliToken
+    });
     this.snapshotValue.data.fundingStatus = status;
     const dns = recordValue(recordValue(status.intent).dns);
     if (dns.status === "propagated" || dns.status === undefined) {
@@ -754,7 +762,9 @@ export class SwitchboardDeployWorkflow {
 
   private async refreshRoute(): Promise<void> {
     const deploymentIntent = this.deploymentIntent();
-    const status = await this.adapters.controlPlane.refreshDeploymentIntentRoute(deploymentIntent.intentId);
+    const status = await this.adapters.controlPlane.refreshDeploymentIntentRoute(deploymentIntent.intentId, {
+      cliToken: deploymentIntent.cliToken
+    });
     this.snapshotValue.data.routeStatus = status;
     const route = recordValue(status.route ?? recordValue(status.intent).route);
     if (route.status === "active" || route.status === undefined) {
@@ -796,7 +806,9 @@ export class SwitchboardDeployWorkflow {
 
   private async observeRegistration(): Promise<void> {
     const deploymentIntent = this.deploymentIntent();
-    const status = await this.adapters.controlPlane.readDeploymentIntent(deploymentIntent.intentId);
+    const status = await this.adapters.controlPlane.readDeploymentIntent(deploymentIntent.intentId, {
+      cliToken: deploymentIntent.cliToken
+    });
     const intent = recordValue(status.intent);
     this.snapshotValue.data.intentStatus = status;
     const funding = recordValue(intent.funding);
