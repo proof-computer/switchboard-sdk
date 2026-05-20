@@ -644,7 +644,8 @@ export class SwitchboardDeployWorkflow {
     const result = await this.adapters.funding.fundQuote({
       workflow: this.snapshot,
       deploymentIntent: this.deploymentIntent(),
-      quote
+      quote,
+      runtime: recordValue(this.snapshotValue.data.runtime)
     });
     if (isRequiredAction(result)) {
       this.snapshotValue.requiredAction = result;

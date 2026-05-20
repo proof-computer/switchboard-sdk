@@ -184,6 +184,18 @@ describe("SwitchboardDeployWorkflow", () => {
     assert.equal(workflow.snapshot.step, "runtime_claimed");
   });
 
+  it("passes the observed runtime signer into single-intent quote funding", async () => {
+    const fundRequests = [];
+    const workflow = new SwitchboardDeployWorkflow(input, fakeAdapters({ fundRequests }));
+
+    const snapshot = await workflow.runToBlocked();
+
+    assert.equal(snapshot.step, "complete");
+    assert.equal(fundRequests.length, 1);
+    assert.equal(fundRequests[0].runtime.runtimeSigner, "0x5000000000000000000000000000000000000005");
+    assert.deepEqual(fundRequests[0].runtime.upstreamIps, ["203.0.113.10"]);
+  });
+
   it("builds a hub.fund action payload with quote and intent metadata but no local tokens", async () => {
     const workflow = new SwitchboardDeployWorkflow(input, fakeAdapters({ requireFundingAction: true }));
     const blocked = await workflow.runToBlocked();
@@ -542,7 +554,8 @@ function fakeAdapters(options = {}) {
           endpointHostname: "e-test.acurast.ingress.works"
         };
       },
-      async fundQuote() {
+      async fundQuote(input) {
+        options.fundRequests?.push(input);
         if (options.requireFundingAction) {
           return {
             id: "fund-1",
