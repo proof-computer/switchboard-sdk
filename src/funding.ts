@@ -1,4 +1,5 @@
 import { ethers } from "ethers";
+import { secureSwitchboardUrl, type SwitchboardTransportSecurityOptions } from "./transport.js";
 
 export const EIP712_DOMAIN_NAME = "ProofIngress";
 export const EIP712_DOMAIN_VERSION = "1";
@@ -201,7 +202,7 @@ export interface RegistryActionDescription {
   reason?: string;
 }
 
-export interface RequestQuoteOptions {
+export interface RequestQuoteOptions extends SwitchboardTransportSecurityOptions {
   relayUrl: string;
   body: Record<string, unknown>;
   cliToken?: string;
@@ -534,13 +535,24 @@ export function assertQuoteWithinCap(quote: IngressQuote, capAmount: string | bi
 }
 
 export async function requestIngressQuote(options: RequestQuoteOptions): Promise<QuoteResponse> {
-  return postQuote(options.fetchImpl ?? fetch, new URL("/v1/ingress-intents", options.relayUrl), options.body, undefined, options.timeoutMs);
+  return postQuote(
+    options.fetchImpl ?? fetch,
+    secureSwitchboardUrl("/v1/ingress-intents", options.relayUrl, "Switchboard quote relay URL", options),
+    options.body,
+    undefined,
+    options.timeoutMs
+  );
 }
 
 export async function requestDeploymentIntentQuote(options: RequestDeploymentIntentQuoteOptions): Promise<QuoteResponse> {
   return postQuote(
     options.fetchImpl ?? fetch,
-    new URL(`/v1/deployment-intents/${encodeURIComponent(options.intentId)}/quote`, options.relayUrl),
+    secureSwitchboardUrl(
+      `/v1/deployment-intents/${encodeURIComponent(options.intentId)}/quote`,
+      options.relayUrl,
+      "Switchboard quote relay URL",
+      options
+    ),
     options.body,
     options.cliToken,
     options.timeoutMs
@@ -552,7 +564,12 @@ export async function requestDeploymentIntentGroupMemberQuote(
 ): Promise<QuoteResponse> {
   return postQuote(
     options.fetchImpl ?? fetch,
-    new URL(`/v1/deployment-intent-groups/${encodeURIComponent(options.groupId)}/members/${encodeURIComponent(options.intentId)}/quote`, options.relayUrl),
+    secureSwitchboardUrl(
+      `/v1/deployment-intent-groups/${encodeURIComponent(options.groupId)}/members/${encodeURIComponent(options.intentId)}/quote`,
+      options.relayUrl,
+      "Switchboard quote relay URL",
+      options
+    ),
     options.body,
     options.cliToken,
     options.timeoutMs
@@ -773,14 +790,14 @@ async function resumeDeploymentIntentQuote(
   const timeoutMs = options.timeoutMs ?? DEFAULT_DEPLOYMENT_INTENT_QUOTE_TIMEOUT_MS;
   const fetchImpl = options.fetchImpl ?? fetch;
   const resumeDeadline = Date.now() + (timeoutMs >= 1_000 ? Math.min(timeoutMs, 30_000) : 0);
-  let status = await requestDeploymentIntentStatus(fetchImpl, options.relayUrl, options.intentId, options.cliToken, timeoutMs);
+  let status = await requestDeploymentIntentStatus(fetchImpl, options, timeoutMs);
   while (true) {
     const resumed = quoteResponseFromDeploymentIntentStatus(status, options.quoteBindingRequest ?? options.body);
     if (resumed) return resumed;
     const remainingMs = resumeDeadline - Date.now();
     if (remainingMs <= 0) break;
     await sleep(Math.min(options.resumePollMs ?? DEPLOYMENT_INTENT_QUOTE_RESUME_POLL_MS, remainingMs));
-    status = await requestDeploymentIntentStatus(fetchImpl, options.relayUrl, options.intentId, options.cliToken, timeoutMs);
+    status = await requestDeploymentIntentStatus(fetchImpl, options, timeoutMs);
   }
   throw new Error(`${label} timed out after ${timeoutMs}ms and no reusable quote was available for ${options.intentId}: ${describeDeploymentIntentStatus(status)}`);
 }
@@ -814,13 +831,17 @@ async function postQuote(
 
 async function requestDeploymentIntentStatus(
   fetchImpl: typeof fetch,
-  relayUrl: string,
-  intentId: string,
-  cliToken: string | undefined,
+  options: RequestDeploymentIntentQuoteOptions,
   timeoutMs: number
 ): Promise<Record<string, unknown>> {
+  const { intentId, cliToken } = options;
   if (!cliToken) throw new Error("Missing deployment intent CLI token.");
-  const response = await fetchImpl(new URL(`/v1/deployment-intents/${encodeURIComponent(intentId)}`, relayUrl), {
+  const response = await fetchImpl(secureSwitchboardUrl(
+    `/v1/deployment-intents/${encodeURIComponent(intentId)}`,
+    options.relayUrl,
+    "Switchboard quote status relay URL",
+    options
+  ), {
     method: "GET",
     headers: { authorization: `Bearer ${cliToken}` },
     signal: AbortSignal.timeout(timeoutMs)

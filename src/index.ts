@@ -3,6 +3,29 @@ import { networkInterfaces } from "node:os";
 import tls, { type SecureContext, type SecureContextOptions } from "node:tls";
 import * as acme from "acme-client";
 import { ethers } from "ethers";
+import { requireSecureSwitchboardUrl, secureSwitchboardUrl, type SwitchboardTransportSecurityOptions } from "./transport.js";
+import {
+  gatewayUpstreamAdmissionDigest,
+  normalizeGatewayUpstreamAdmissionPayload,
+  normalizeSecp256k1SignatureForDigest,
+  type GatewayUpstreamAdmissionPayload,
+  type SignedGatewayUpstreamObservation
+} from "./gateway-upstream-admission.js";
+
+export {
+  GATEWAY_UPSTREAM_ADMISSION_REQUEST_DOMAIN,
+  GATEWAY_UPSTREAM_OBSERVATION_DOMAIN,
+  gatewayUpstreamAdmissionDigest,
+  gatewayUpstreamAdmissionId,
+  gatewayUpstreamObservationDigest,
+  normalizeGatewayUpstreamAdmissionPayload,
+  normalizeGatewayUpstreamObservationPayload,
+  normalizeSecp256k1SignatureForDigest,
+  recoverGatewayUpstreamAdmissionSigner,
+  type GatewayUpstreamAdmissionPayload,
+  type GatewayUpstreamObservationPayload,
+  type SignedGatewayUpstreamObservation
+} from "./gateway-upstream-admission.js";
 
 export const SWITCHBOARD_CHALLENGE_PATH = "/.well-known/proofcomputer/challenge";
 export const SWITCHBOARD_STATUS_PATH = "/.well-known/proofcomputer/status";
@@ -109,6 +132,9 @@ export interface SwitchboardJobSigner {
     registryAddress: string;
     request: CustomerHostnamePollRequestPayload;
   }): Promise<string>;
+  signGatewayUpstreamAdmission?(input: {
+    request: GatewayUpstreamAdmissionPayload;
+  }): Promise<string>;
 }
 
 export interface AcurastRuntimeStd {
@@ -146,6 +172,7 @@ export interface SwitchboardRegistrationConfig {
   jobSigner?: SwitchboardJobSigner;
   jobSignerPrivateKey?: string;
   requestTimeoutMs?: number;
+  allowInsecureHttp?: boolean;
 }
 
 export interface SwitchboardCertificateConfig {
@@ -161,6 +188,7 @@ export interface SwitchboardCertificateConfig {
   jobSigner?: SwitchboardJobSigner;
   jobSignerPrivateKey?: string;
   requestTimeoutMs?: number;
+  allowInsecureHttp?: boolean;
 }
 
 export interface SwitchboardRegistrationRequest {
@@ -234,6 +262,7 @@ export interface SwitchboardCustomerHostnamePollConfig {
   jobSigner?: SwitchboardJobSigner;
   jobSignerPrivateKey?: string;
   requestTimeoutMs?: number;
+  allowInsecureHttp?: boolean;
 }
 
 export interface SwitchboardManagedCertificate {
@@ -285,6 +314,7 @@ export interface SwitchboardRuntimeConfig {
   operatorId?: string;
   processorId?: string;
   gatewayId?: string;
+  gatewayUpstreamAdmissionUrl?: string;
   endpointHostname?: string;
   certificateMode?: string;
   certificateHostnames?: string[];
@@ -303,6 +333,7 @@ export interface SwitchboardRuntimeOptions {
   fetchImpl?: typeof fetch;
   deploymentId?: string;
   initialConfig?: Record<string, string>;
+  allowInsecureHttp?: boolean;
   onError?: (error: unknown, event: string) => void;
 }
 
@@ -310,6 +341,14 @@ export interface SwitchboardRuntimePrepareResult {
   certificates: SwitchboardManagedCertificate[];
   tlsOptions?: SwitchboardTlsOptions;
   registration?: SwitchboardRegistrationResult;
+}
+
+export interface SwitchboardGatewayUpstreamAdmissionResult {
+  request: GatewayUpstreamAdmissionPayload;
+  requestSignature: string;
+  observation: SignedGatewayUpstreamObservation["observation"];
+  observationSignature: SignedGatewayUpstreamObservation["signature"];
+  relayResponse: unknown;
 }
 
 export type SwitchboardTlsOptions = SecureContextOptions & {
@@ -336,6 +375,7 @@ export interface SwitchboardRemoteLoggerConfig {
   baseRecord?: () => Record<string, unknown>;
   onError?: (error: unknown, event: string) => void;
   fetchImpl?: typeof fetch;
+  allowInsecureHttp?: boolean;
 }
 
 export interface ProofLogEncryptedRecord {
@@ -403,10 +443,12 @@ export class SwitchboardRuntime {
   private readonly env: NodeJS.ProcessEnv;
   private readonly std?: AcurastRuntimeStd;
   private readonly fetchImpl: typeof fetch;
+  private readonly allowInsecureHttp: boolean;
   private readonly runtimeConfig: Record<string, string>;
   private readonly logEvent: (event: string, details?: Record<string, unknown>) => Promise<void>;
   private readonly managedCertificates: SwitchboardManagedCertificate[] = [];
   private readonly managedCertificateContexts = new Map<string, SecureContext>();
+  private gatewayUpstreamAdmission?: SwitchboardGatewayUpstreamAdmissionResult;
   private customerHostnamePollTimer?: NodeJS.Timeout;
   private customerHostnamePollActive = false;
   private customerHostnamePollStopped = false;
@@ -415,6 +457,7 @@ export class SwitchboardRuntime {
     this.env = options.env ?? process.env;
     this.std = options.std ?? (globalThis as { _STD_?: AcurastRuntimeStd })._STD_;
     this.fetchImpl = options.fetchImpl ?? fetch;
+    this.allowInsecureHttp = options.allowInsecureHttp === true;
     this.runtimeConfig = {
       ...readSwitchboardConfig(options.env ?? process.env, this.std),
       ...(options.initialConfig ?? {})
@@ -428,6 +471,7 @@ export class SwitchboardRuntime {
       timeoutMs: numberConfig(this, "SWITCHBOARD_LOG_TIMEOUT_MS", 5_000),
       context: this.configValue("SWITCHBOARD_LOG_CONTEXT"),
       fetchImpl: this.fetchImpl,
+      allowInsecureHttp: this.allowInsecureHttp,
       onError: options.onError,
       baseRecord: () => ({
         sessionId: this.sessionId(),
@@ -512,7 +556,7 @@ export class SwitchboardRuntime {
   }
 
   private async prepareFromDeploymentIntentGroup(): Promise<SwitchboardRuntimePrepareResult> {
-    const relayUrl = this.requiredConfig("SWITCHBOARD_RELAY_URL");
+    const relayUrl = this.requiredSecureRelayUrl("SWITCHBOARD_RELAY_URL");
     const groupId = this.requiredConfig("SWITCHBOARD_INTENT_GROUP_ID");
     const intentToken = this.requiredConfig("SWITCHBOARD_INTENT_TOKEN");
     allowAcurastHostname(relayUrl, this.std);
@@ -545,15 +589,25 @@ export class SwitchboardRuntime {
     if (!this.intentConfigured()) {
       return;
     }
+    const upstreamAdmission = await this.admitGatewayUpstream();
     await this.reportIntentHealthBestEffort("ready", {
       sessionId: this.sessionId(),
       endpointHostname: this.configValue("ENDPOINT_HOSTNAME"),
+      protocol: "https",
+      port: this.gatewayUpstreamPort(),
+      gatewayUpstreamAdmission: upstreamAdmission
+        ? {
+            admissionId: upstreamAdmission.observation.admissionId,
+            observedAt: upstreamAdmission.observation.observedAt,
+            expiresAt: upstreamAdmission.observation.expiresAt
+          }
+        : undefined,
       ...details
     });
   }
 
   private async prepareFromDeploymentIntent(): Promise<SwitchboardRuntimePrepareResult> {
-    const relayUrl = this.requiredConfig("SWITCHBOARD_RELAY_URL");
+    const relayUrl = this.requiredSecureRelayUrl("SWITCHBOARD_RELAY_URL");
     const intentId = this.requiredConfig("SWITCHBOARD_INTENT_ID");
     const intentToken = this.requiredConfig("SWITCHBOARD_INTENT_TOKEN");
     allowAcurastHostname(relayUrl, this.std);
@@ -672,7 +726,12 @@ export class SwitchboardRuntime {
     signerMode: string;
     processorIdentity: AcurastProcessorIdentity;
   }): Promise<Record<string, unknown>> {
-    const response = await this.fetchImpl(new URL(`/v1/deployment-intent-groups/${encodeURIComponent(input.groupId)}/claim`, input.relayUrl), {
+    const response = await this.fetchImpl(secureSwitchboardUrl(
+      `/v1/deployment-intent-groups/${encodeURIComponent(input.groupId)}/claim`,
+      input.relayUrl,
+      "Switchboard relay URL",
+      this.transportOptions()
+    ), {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -711,7 +770,7 @@ export class SwitchboardRuntime {
   ): Promise<void> {
     await this.intentFetch(
       {
-        relayUrl: this.requiredConfig("SWITCHBOARD_RELAY_URL"),
+        relayUrl: this.requiredSecureRelayUrl("SWITCHBOARD_RELAY_URL"),
         intentId: this.requiredConfig("SWITCHBOARD_INTENT_ID"),
         intentToken: this.requiredConfig("SWITCHBOARD_INTENT_TOKEN")
       },
@@ -739,7 +798,12 @@ export class SwitchboardRuntime {
     intentId: string,
     intentToken: string
   ): Promise<SwitchboardRuntimeConfigResponse> {
-    const response = await this.fetchImpl(new URL(`/v1/deployment-intents/${encodeURIComponent(intentId)}/runtime-config`, relayUrl), {
+    const response = await this.fetchImpl(secureSwitchboardUrl(
+      `/v1/deployment-intents/${encodeURIComponent(intentId)}/runtime-config`,
+      relayUrl,
+      "Switchboard relay URL",
+      this.transportOptions()
+    ), {
       method: "GET",
       headers: { authorization: `Bearer ${intentToken}` },
       signal: AbortSignal.timeout(this.intentRequestTimeoutMs())
@@ -759,7 +823,12 @@ export class SwitchboardRuntime {
     endpoint: "claim" | "health",
     body: Record<string, unknown>
   ): Promise<Record<string, unknown>> {
-    const response = await this.fetchImpl(new URL(`/v1/deployment-intents/${encodeURIComponent(input.intentId)}/${endpoint}`, input.relayUrl), {
+    const response = await this.fetchImpl(secureSwitchboardUrl(
+      `/v1/deployment-intents/${encodeURIComponent(input.intentId)}/${endpoint}`,
+      input.relayUrl,
+      "Switchboard relay URL",
+      this.transportOptions()
+    ), {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -785,6 +854,7 @@ export class SwitchboardRuntime {
       OPERATOR_ID: requiredRuntimeConfig(config.operatorId, "operatorId"),
       PROCESSOR_ID: requiredRuntimeConfig(config.processorId, "processorId"),
       GATEWAY_ID: config.gatewayId,
+      GATEWAY_UPSTREAM_ADMISSION_URL: config.gatewayUpstreamAdmissionUrl,
       ENDPOINT_HOSTNAME: requiredRuntimeConfig(config.endpointHostname, "endpointHostname"),
       SWITCHBOARD_CERTIFICATE_MODE: config.certificateMode ?? "job-acme",
       SWITCHBOARD_CERTIFICATE_HOSTNAMES: (config.certificateHostnames ?? [config.endpointHostname]).filter(Boolean).join(",")
@@ -806,7 +876,8 @@ export class SwitchboardRuntime {
       nonce: this.configValue("NONCE"),
       deadline: this.configValue("DEADLINE"),
       jobSigner: signer.signer,
-      requestTimeoutMs: numberConfig(this, "CONTRACT_CALL_TIMEOUT_MS", 120_000)
+      requestTimeoutMs: numberConfig(this, "CONTRACT_CALL_TIMEOUT_MS", 120_000),
+      allowInsecureHttp: this.allowInsecureHttp
     }, this.fetchImpl);
     await this.log("registration-succeeded", {
       attempt,
@@ -855,7 +926,8 @@ export class SwitchboardRuntime {
               sessionId: this.requiredConfig("SESSION_ID"),
               hostname,
               jobSigner: signer.signer,
-              requestTimeoutMs: numberConfig(this, "SWITCHBOARD_CERTIFICATE_REQUEST_TIMEOUT_MS", 120_000)
+              requestTimeoutMs: numberConfig(this, "SWITCHBOARD_CERTIFICATE_REQUEST_TIMEOUT_MS", 120_000),
+              allowInsecureHttp: this.allowInsecureHttp
             }, this.fetchImpl);
           } catch (error) {
             throw asSwitchboardCertificateError(error, {
@@ -918,6 +990,105 @@ export class SwitchboardRuntime {
     }
 
     return [];
+  }
+
+  async admitGatewayUpstream(): Promise<SwitchboardGatewayUpstreamAdmissionResult | undefined> {
+    const gatewayAdmissionUrl = this.configValue("GATEWAY_UPSTREAM_ADMISSION_URL");
+    if (!gatewayAdmissionUrl || !this.intentConfigured()) {
+      return undefined;
+    }
+    if (this.gatewayUpstreamAdmission && Date.parse(this.gatewayUpstreamAdmission.observation.expiresAt) > Date.now()) {
+      return this.gatewayUpstreamAdmission;
+    }
+    const signer = await this.jobSigner();
+    if (!signer.signer.signGatewayUpstreamAdmission) {
+      throw new Error("Current Switchboard job signer cannot sign gateway upstream admissions");
+    }
+    const request = normalizeGatewayUpstreamAdmissionPayload({
+      intentId: this.requiredConfig("SWITCHBOARD_INTENT_ID"),
+      sessionId: this.requiredConfig("SESSION_ID"),
+      runtimeSigner: await signer.signer.getAddress(),
+      operatorId: this.requiredConfig("OPERATOR_ID"),
+      gatewayId: this.requiredConfig("GATEWAY_ID"),
+      processorId: this.requiredConfig("PROCESSOR_ID"),
+      hostname: this.requiredConfig("ENDPOINT_HOSTNAME"),
+      validationHostname: this.configValue("VALIDATION_HOSTNAME"),
+      upstreamPort: this.gatewayUpstreamPort(),
+      nonce: randomBytes(16).toString("hex"),
+      deadline: String(Math.floor(Date.now() / 1000) + numberConfig(this, "GATEWAY_UPSTREAM_ADMISSION_DEADLINE_SECONDS", 600))
+    });
+    const requestSignature = await signer.signer.signGatewayUpstreamAdmission({ request });
+    const gatewayUrl = requireSecureSwitchboardUrl(gatewayAdmissionUrl, "Switchboard gateway upstream admission URL", this.transportOptions());
+    allowAcurastHostname(gatewayUrl.toString(), this.std);
+    const gatewayResponse = await this.fetchImpl(gatewayUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ request, signature: requestSignature }),
+      signal: AbortSignal.timeout(this.intentRequestTimeoutMs())
+    });
+    const gatewayBody = await gatewayResponse.json() as Record<string, unknown>;
+    if (!gatewayResponse.ok) {
+      throw new Error(`Switchboard gateway upstream admission failed: ${gatewayResponse.status} ${JSON.stringify(gatewayBody)}`);
+    }
+    const observation = objectRecordField(gatewayBody, "observation") as unknown as SignedGatewayUpstreamObservation["observation"];
+    const observationSignature = objectRecordField(gatewayBody, "observationSignature") as SignedGatewayUpstreamObservation["signature"];
+    const relayResponse = await this.submitGatewayUpstreamAdmission({
+      request,
+      requestSignature,
+      observation,
+      observationSignature
+    });
+    const result = {
+      request,
+      requestSignature,
+      observation,
+      observationSignature,
+      relayResponse
+    };
+    this.gatewayUpstreamAdmission = result;
+    await this.log("gateway-upstream-admitted", {
+      admissionId: observation.admissionId,
+      gatewayId: request.gatewayId,
+      upstreamPort: request.upstreamPort,
+      observedAt: observation.observedAt,
+      expiresAt: observation.expiresAt
+    });
+    return result;
+  }
+
+  private async submitGatewayUpstreamAdmission(input: {
+    request: GatewayUpstreamAdmissionPayload;
+    requestSignature: string;
+    observation: SignedGatewayUpstreamObservation["observation"];
+    observationSignature: SignedGatewayUpstreamObservation["signature"];
+  }): Promise<unknown> {
+    const response = await this.fetchImpl(secureSwitchboardUrl(
+      `/v1/deployment-intents/${encodeURIComponent(this.requiredConfig("SWITCHBOARD_INTENT_ID"))}/upstream-admissions`,
+      this.requiredSecureRelayUrl("SWITCHBOARD_RELAY_URL"),
+      "Switchboard relay URL",
+      this.transportOptions()
+    ), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${this.requiredConfig("SWITCHBOARD_INTENT_TOKEN")}`
+      },
+      body: JSON.stringify(input),
+      signal: AbortSignal.timeout(this.intentRequestTimeoutMs())
+    });
+    const body = await response.json();
+    if (!response.ok) {
+      throw new Error(`Switchboard relay upstream admission submit failed: ${response.status} ${JSON.stringify(body)}`);
+    }
+    return body;
+  }
+
+  private gatewayUpstreamPort(): number {
+    return numberConfig(
+      this,
+      "GATEWAY_UPSTREAM_PORT",
+      numberConfig(this, "SWITCHBOARD_UPSTREAM_PORT", numberConfig(this, "PORT", 3000))
+    );
   }
 
   private prepareManagedCertificateResult(certificates: SwitchboardManagedCertificate[]): SwitchboardRuntimePrepareResult {
@@ -1050,7 +1221,8 @@ export class SwitchboardRuntime {
         sessionId: this.requiredConfig("SESSION_ID"),
         endpointHostname,
         jobSigner,
-        requestTimeoutMs: numberConfig(this, "SWITCHBOARD_CUSTOMER_HOSTNAME_POLL_TIMEOUT_MS", this.intentRequestTimeoutMs())
+        requestTimeoutMs: numberConfig(this, "SWITCHBOARD_CUSTOMER_HOSTNAME_POLL_TIMEOUT_MS", this.intentRequestTimeoutMs()),
+        allowInsecureHttp: this.allowInsecureHttp
       }, this.fetchImpl);
       const hostnames = customerHostnamePollHostnames(response)
         .map(normalizeHostname)
@@ -1097,6 +1269,15 @@ export class SwitchboardRuntime {
     return value;
   }
 
+  private requiredSecureRelayUrl(name: string): string {
+    const value = this.requiredConfig(name);
+    return requireSecureSwitchboardUrl(value, name, this.transportOptions()).toString();
+  }
+
+  private transportOptions(): SwitchboardTransportSecurityOptions {
+    return { allowInsecureHttp: this.allowInsecureHttp };
+  }
+
   private intentRequestTimeoutMs(): number {
     return numberConfig(this, "SWITCHBOARD_INTENT_REQUEST_TIMEOUT_MS", DEFAULT_SWITCHBOARD_INTENT_REQUEST_TIMEOUT_MS);
   }
@@ -1112,6 +1293,7 @@ export * from "./network-manifest.js";
 export * from "./report-signing.js";
 export * from "./service-catalog.js";
 export * from "./service-discovery.js";
+export type { SwitchboardTransportSecurityOptions } from "./transport.js";
 
 export function buildSwitchboardChallengeResult(
   config: SwitchboardChallengeConfig,
@@ -1336,6 +1518,9 @@ export function privateKeyJobSigner(privateKey: string): SwitchboardJobSigner {
     },
     async signCustomerHostnamePollRequest(input) {
       return signCustomerHostnamePollRequest(wallet, input.chainId, input.registryAddress, input.request);
+    },
+    async signGatewayUpstreamAdmission(input) {
+      return wallet.signingKey.sign(gatewayUpstreamAdmissionDigest(input.request)).serialized;
     }
   };
 }
@@ -1377,6 +1562,10 @@ export function acurastJobSigner(
     async signCustomerHostnamePollRequest(input) {
       const digest = customerHostnamePollRequestDigest(input.chainId, input.registryAddress, input.request);
       return signAcurastSecp256k1Digest(sign, digest, await getAddress(), std);
+    },
+    async signGatewayUpstreamAdmission(input) {
+      const digest = gatewayUpstreamAdmissionDigest(input.request);
+      return signAcurastSecp256k1Digest(sign, digest, await getAddress(), std);
     }
   };
 }
@@ -1407,8 +1596,9 @@ export async function registerIngressWithRelay(
   config: SwitchboardRegistrationConfig,
   fetchImpl: typeof fetch = fetch
 ): Promise<SwitchboardRegistrationResult> {
+  const relayUrl = requireSecureSwitchboardUrl(config.relayUrl, "Switchboard relay URL", config);
   const request = await buildIngressRegistrationRequest(config);
-  const response = await fetchImpl(new URL("/v1/ingress-registrations", config.relayUrl), {
+  const response = await fetchImpl(new URL("/v1/ingress-registrations", relayUrl), {
     method: "POST",
     headers: { "content-type": "application/json" },
     signal: AbortSignal.timeout(config.requestTimeoutMs ?? 120_000),
@@ -1470,8 +1660,9 @@ export async function requestCertificateWithRelay(
   config: SwitchboardCertificateConfig,
   fetchImpl: typeof fetch = fetch
 ): Promise<SwitchboardCertificateResult> {
+  const relayUrl = requireSecureSwitchboardUrl(config.relayUrl, "Switchboard relay URL", config);
   const request = await buildIngressCertificateRequest(config);
-  const response = await fetchImpl(new URL("/v1/certificates", config.relayUrl), {
+  const response = await fetchImpl(new URL("/v1/certificates", relayUrl), {
     method: "POST",
     headers: { "content-type": "application/json" },
     signal: AbortSignal.timeout(config.requestTimeoutMs ?? 120_000),
@@ -1522,9 +1713,10 @@ export async function pollCustomerHostnameAuthorizationsWithRelay(
   config: SwitchboardCustomerHostnamePollConfig,
   fetchImpl: typeof fetch = fetch
 ): Promise<SwitchboardCustomerHostnamePollResponse> {
+  const relayUrl = requireSecureSwitchboardUrl(config.relayUrl, "Switchboard relay URL", config);
   const request = await buildCustomerHostnamePollRequest(config);
   const response = await fetchImpl(
-    new URL(`/v1/deployment-intents/${encodeURIComponent(config.intentId)}/customer-hostname-authorizations`, config.relayUrl),
+    new URL(`/v1/deployment-intents/${encodeURIComponent(config.intentId)}/customer-hostname-authorizations`, relayUrl),
     {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -1562,7 +1754,8 @@ export function createEncryptedSwitchboardLogger(
         details
       };
       const encrypted = encryptProofLogRecord(config.encryptionKey!, record);
-      const response = await fetchImpl(config.logUrl!, {
+      const logUrl = requireSecureSwitchboardUrl(config.logUrl!, "Switchboard log URL", config);
+      const response = await fetchImpl(logUrl, {
         method: "POST",
         headers: {
           "content-type": "application/json",
@@ -2084,6 +2277,17 @@ function numberRecordField(record: unknown, name: string): number | undefined {
     return Number.isFinite(parsed) ? parsed : undefined;
   }
   return undefined;
+}
+
+function objectRecordField(record: unknown, name: string): Record<string, unknown> {
+  if (!record || typeof record !== "object") {
+    throw new Error(`${name} missing`);
+  }
+  const value = (record as Record<string, unknown>)[name];
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${name} missing`);
+  }
+  return value as Record<string, unknown>;
 }
 
 function dynamicString(value: string | (() => string)): string {

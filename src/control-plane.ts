@@ -1,13 +1,14 @@
 import type { QuoteResponse } from "./funding.js";
+import { requireSecureSwitchboardUrl, secureSwitchboardUrl, type SwitchboardTransportSecurityOptions } from "./transport.js";
 
-export interface SwitchboardControlPlaneClientOptions {
+export interface SwitchboardControlPlaneClientOptions extends SwitchboardTransportSecurityOptions {
   relayUrl: string;
   cliToken?: string;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
 }
 
-export interface SwitchboardRequestOptions {
+export interface SwitchboardRequestOptions extends SwitchboardTransportSecurityOptions {
   cliToken?: string;
   timeoutMs?: number;
 }
@@ -87,9 +88,11 @@ export class SwitchboardControlPlaneClient {
   readonly cliToken?: string;
   private readonly fetchImpl: typeof fetch;
   private readonly timeoutMs: number;
+  private readonly allowInsecureHttp: boolean;
 
   constructor(options: SwitchboardControlPlaneClientOptions) {
-    this.relayUrl = options.relayUrl;
+    this.allowInsecureHttp = options.allowInsecureHttp === true;
+    this.relayUrl = requireSecureSwitchboardUrl(options.relayUrl, "Switchboard control-plane relay URL", options).toString();
     this.cliToken = options.cliToken;
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.timeoutMs = options.timeoutMs ?? 60_000;
@@ -276,7 +279,12 @@ export class SwitchboardControlPlaneClient {
     body: object | undefined,
     options: SwitchboardRequestOptions
   ): Promise<Record<string, unknown>> {
-    return this.requestJsonUrl(method, new URL(pathname, this.relayUrl), body, options);
+    return this.requestJsonUrl(
+      method,
+      secureSwitchboardUrl(pathname, this.relayUrl, "Switchboard control-plane relay URL", this.transportOptions(options)),
+      body,
+      options
+    );
   }
 
   private async requestJsonUrl(
@@ -285,6 +293,7 @@ export class SwitchboardControlPlaneClient {
     body: object | undefined,
     options: SwitchboardRequestOptions
   ): Promise<Record<string, unknown>> {
+    requireSecureSwitchboardUrl(url, "Switchboard control-plane request URL", this.transportOptions(options));
     const token = options.cliToken ?? this.cliToken;
     const response = await this.fetchImpl(url, {
       method,
@@ -302,6 +311,10 @@ export class SwitchboardControlPlaneClient {
       throw new Error(`${method} ${url.pathname} failed (${response.status}): ${text.slice(0, 1000)}`);
     }
     return json as Record<string, unknown>;
+  }
+
+  private transportOptions(options: SwitchboardRequestOptions = {}): SwitchboardTransportSecurityOptions {
+    return { allowInsecureHttp: options.allowInsecureHttp === true || this.allowInsecureHttp };
   }
 }
 

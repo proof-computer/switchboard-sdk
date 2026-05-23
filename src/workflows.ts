@@ -29,6 +29,7 @@ export type SwitchboardDeployWorkflowStep =
 export interface SwitchboardDeployWorkflowInput {
   deploymentMode?: "single" | "group";
   relayUrl: string;
+  allowInsecureHttp?: boolean;
   jobId?: string;
   sessionLabel?: string;
   developer?: string;
