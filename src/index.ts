@@ -188,7 +188,18 @@ export interface SwitchboardCertificateConfig {
   jobSigner?: SwitchboardJobSigner;
   jobSignerPrivateKey?: string;
   requestTimeoutMs?: number;
+  certificateKeyAlgorithm?: SwitchboardCertificateKeyAlgorithm;
+  onProgress?: (progress: SwitchboardCertificateRequestProgress) => void | Promise<void>;
   allowInsecureHttp?: boolean;
+}
+
+export type SwitchboardCertificateKeyAlgorithm = "ecdsa-p256" | "rsa-2048";
+
+export type SwitchboardCertificateRequestProgressStage = "csr_generation" | "request_signing" | "relay_request";
+
+export interface SwitchboardCertificateRequestProgress {
+  stage: SwitchboardCertificateRequestProgressStage;
+  hostname: string;
 }
 
 export interface SwitchboardRegistrationRequest {
@@ -275,8 +286,12 @@ export interface SwitchboardManagedCertificate {
 
 export type SwitchboardCertificateFailureStage =
   | "hostname_config"
+  | "certificate_config"
   | "certificate_lock"
   | "certificate_request"
+  | "csr_generation"
+  | "request_signing"
+  | "relay_request"
   | "certificate_authorization"
   | "acme_issuance"
   | "relay_response";
@@ -286,6 +301,7 @@ export interface SwitchboardCertificateErrorOptions {
   hostname?: string;
   status?: number;
   relayResponse?: unknown;
+  details?: Record<string, unknown>;
   cause?: unknown;
 }
 
@@ -294,6 +310,7 @@ export class SwitchboardCertificateError extends Error {
   readonly hostname: string | undefined;
   readonly status: number | undefined;
   readonly relayResponse: unknown;
+  readonly details: Record<string, unknown> | undefined;
 
   constructor(message: string, options: SwitchboardCertificateErrorOptions) {
     super(message, options.cause === undefined ? undefined : { cause: options.cause });
@@ -302,6 +319,7 @@ export class SwitchboardCertificateError extends Error {
     this.hostname = options.hostname;
     this.status = options.status;
     this.relayResponse = options.relayResponse;
+    this.details = options.details;
   }
 }
 
@@ -898,13 +916,45 @@ export class SwitchboardRuntime {
     }
     const retryMs = numberConfig(this, "SWITCHBOARD_CERTIFICATE_RETRY_MS", numberConfig(this, "SWITCHBOARD_REGISTRATION_RETRY_MS", 30_000));
     const maxAttempts = numberConfig(this, "SWITCHBOARD_CERTIFICATE_MAX_ATTEMPTS", 0);
+    const requestTimeoutMs = numberConfig(this, "SWITCHBOARD_CERTIFICATE_REQUEST_TIMEOUT_MS", 120_000);
+    let certificateKeyAlgorithm: SwitchboardCertificateKeyAlgorithm;
+    try {
+      certificateKeyAlgorithm = certificateKeyAlgorithmConfig(this);
+    } catch (error) {
+      const certificateError = asSwitchboardCertificateError(error, {
+        stage: "certificate_config"
+      });
+      const errorDetails = switchboardCertificateErrorDetails(certificateError);
+      await this.log("certificate-request-failed", {
+        attempt: 1,
+        maxAttempts,
+        hostnames,
+        requestTimeoutMs,
+        retryExhausted: true,
+        ...errorDetails
+      });
+      await this.reportIntentHealth("failed", {
+        attempt: 1,
+        maxAttempts,
+        hostnames,
+        requestTimeoutMs,
+        retryExhausted: true,
+        ...errorDetails
+      }).catch(() => undefined);
+      throw certificateError;
+    }
+    const certificateRequestDetails = {
+      hostnames,
+      certificateKeyAlgorithm,
+      requestTimeoutMs
+    };
 
     for (let attempt = 1; maxAttempts === 0 || attempt <= maxAttempts; attempt += 1) {
       try {
         await this.reportIntentHealth("certificate_requesting", {
           attempt,
           stage: "certificate_request",
-          hostnames
+          ...certificateRequestDetails
         }).catch(() => undefined);
         const signer = await this.jobSigner();
         const certificates: SwitchboardManagedCertificate[] = [];
@@ -912,6 +962,9 @@ export class SwitchboardRuntime {
           await this.log("certificate-request-started", {
             attempt,
             hostname,
+            hostnames,
+            certificateKeyAlgorithm,
+            requestTimeoutMs,
             endpointHostname: this.configValue("ENDPOINT_HOSTNAME"),
             relayHost: safeUrlHost(this.requiredConfig("RELAY_URL")),
             signerMode: signer.mode,
@@ -926,7 +979,15 @@ export class SwitchboardRuntime {
               sessionId: this.requiredConfig("SESSION_ID"),
               hostname,
               jobSigner: signer.signer,
-              requestTimeoutMs: numberConfig(this, "SWITCHBOARD_CERTIFICATE_REQUEST_TIMEOUT_MS", 120_000),
+              requestTimeoutMs,
+              certificateKeyAlgorithm,
+              onProgress: (progress) =>
+                this.reportIntentHealth("certificate_requesting", {
+                  attempt,
+                  stage: progress.stage,
+                  hostname: progress.hostname,
+                  ...certificateRequestDetails
+                }).catch(() => undefined),
               allowInsecureHttp: this.allowInsecureHttp
             }, this.fetchImpl);
           } catch (error) {
@@ -953,6 +1014,8 @@ export class SwitchboardRuntime {
         }
         await this.log("certificate-issued", {
           attempt,
+          certificateKeyAlgorithm,
+          requestTimeoutMs,
           hostnames: certificates.map((certificate) => certificate.hostname),
           certificates: certificates.map((certificate) => ({
             hostname: certificate.hostname,
@@ -962,22 +1025,25 @@ export class SwitchboardRuntime {
         });
         return certificates;
       } catch (error) {
-        const willRetry = maxAttempts === 0 || attempt < maxAttempts;
         const certificateError = asSwitchboardCertificateError(error, {
           stage: "certificate_request"
         });
+        const retryable = certificateError.stage !== "certificate_config" && certificateError.stage !== "hostname_config";
+        const willRetry = retryable && (maxAttempts === 0 || attempt < maxAttempts);
         const retryAfterMs = certificateRetryAfterMs(certificateError);
         const nextRetryMs = retryAfterMs ?? retryMs;
         const errorDetails = switchboardCertificateErrorDetails(certificateError);
         await this.log("certificate-request-failed", {
           attempt,
           maxAttempts,
+          ...certificateRequestDetails,
           retryMs: willRetry ? nextRetryMs : undefined,
           ...errorDetails
         });
         await this.reportIntentHealth(willRetry ? "certificate_requesting" : "failed", {
           attempt,
           maxAttempts,
+          ...certificateRequestDetails,
           retryMs: willRetry ? nextRetryMs : undefined,
           retryExhausted: !willRetry,
           ...errorDetails
@@ -1612,13 +1678,19 @@ export async function registerIngressWithRelay(
 }
 
 export async function createSwitchboardCertificateSigningRequest(
-  hostname: string
+  hostname: string,
+  options: { keyAlgorithm?: SwitchboardCertificateKeyAlgorithm } = {}
 ): Promise<SwitchboardCertificateSigningRequest> {
   const normalizedHostname = normalizeHostname(hostname);
-  const [privateKey, csr] = await acme.crypto.createCsr({
+  const keyAlgorithm = normalizeSwitchboardCertificateKeyAlgorithm(options.keyAlgorithm, normalizedHostname);
+  const privateKey =
+    keyAlgorithm === "rsa-2048"
+      ? await acme.crypto.createPrivateRsaKey(2048)
+      : await acme.crypto.createPrivateEcdsaKey("P-256");
+  const [, csr] = await acme.crypto.createCsr({
     commonName: normalizedHostname,
     altNames: [normalizedHostname]
-  });
+  }, privateKey);
   return {
     privateKeyPem: privateKey.toString("utf8"),
     csrPem: csr.toString("utf8")
@@ -1630,24 +1702,49 @@ export const createProofIngressCertificateSigningRequest = createSwitchboardCert
 export async function buildIngressCertificateRequest(
   config: SwitchboardCertificateConfig
 ): Promise<SwitchboardCertificateRelayRequest & { privateKeyPem?: string }> {
+  const timeoutContext = createSwitchboardCertificateTimeoutContext(config.requestTimeoutMs ?? 120_000);
+  try {
+    return await buildIngressCertificateRequestWithContext(config, timeoutContext);
+  } finally {
+    clearSwitchboardCertificateTimeoutContext(timeoutContext);
+  }
+}
+
+async function buildIngressCertificateRequestWithContext(
+  config: SwitchboardCertificateConfig,
+  timeoutContext: SwitchboardCertificateTimeoutContext
+): Promise<SwitchboardCertificateRelayRequest & { privateKeyPem?: string }> {
   const jobSigner = config.jobSigner ?? localJobSigner(config.jobSignerPrivateKey);
-  const csr =
-    config.csrPem == null
-      ? await createSwitchboardCertificateSigningRequest(config.hostname)
-      : { csrPem: config.csrPem, privateKeyPem: config.privateKeyPem };
+  const hostname = normalizeHostname(config.hostname);
+  const certificateKeyAlgorithm = normalizeSwitchboardCertificateKeyAlgorithm(config.certificateKeyAlgorithm, hostname);
+  let csr: SwitchboardCertificateSigningRequest | { csrPem: string; privateKeyPem?: string };
+  if (config.csrPem == null) {
+    await config.onProgress?.({ stage: "csr_generation", hostname });
+    csr = await runSwitchboardCertificateStage(timeoutContext, "csr_generation", hostname, () =>
+      createSwitchboardCertificateSigningRequest(hostname, { keyAlgorithm: certificateKeyAlgorithm })
+    );
+  } else {
+    csr = { csrPem: config.csrPem, privateKeyPem: config.privateKeyPem };
+  }
+  await config.onProgress?.({ stage: "request_signing", hostname });
+  const jobSignerAddress = await runSwitchboardCertificateStage(timeoutContext, "request_signing", hostname, () =>
+    jobSigner.getAddress()
+  );
   const certificateRequest: CertificateRequestPayload = {
     sessionId: ethers.hexlify(config.sessionId),
-    jobSigner: await jobSigner.getAddress(),
-    hostname: normalizeHostname(config.hostname),
+    jobSigner: jobSignerAddress,
+    hostname,
     csrHash: csrPemHash(csr.csrPem),
     nonce: config.nonce ?? Date.now(),
     deadline: config.deadline ?? Math.floor(Date.now() / 1000) + 600
   };
-  const signature = await jobSigner.signCertificateRequest({
-    chainId: config.chainId,
-    registryAddress: config.registryAddress,
-    certificateRequest
-  });
+  const signature = await runSwitchboardCertificateStage(timeoutContext, "request_signing", hostname, () =>
+    jobSigner.signCertificateRequest({
+      chainId: config.chainId,
+      registryAddress: config.registryAddress,
+      certificateRequest
+    })
+  );
   return {
     certificateRequest,
     csrPem: csr.csrPem,
@@ -1661,17 +1758,27 @@ export async function requestCertificateWithRelay(
   fetchImpl: typeof fetch = fetch
 ): Promise<SwitchboardCertificateResult> {
   const relayUrl = requireSecureSwitchboardUrl(config.relayUrl, "Switchboard relay URL", config);
-  const request = await buildIngressCertificateRequest(config);
-  const response = await fetchImpl(new URL("/v1/certificates", relayUrl), {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    signal: AbortSignal.timeout(config.requestTimeoutMs ?? 120_000),
-    body: JSON.stringify({
-      certificateRequest: request.certificateRequest,
-      csrPem: request.csrPem,
-      signature: request.signature
-    })
-  });
+  const timeoutContext = createSwitchboardCertificateTimeoutContext(config.requestTimeoutMs ?? 120_000);
+  let request: SwitchboardCertificateRelayRequest & { privateKeyPem?: string };
+  let response: Response;
+  try {
+    request = await buildIngressCertificateRequestWithContext(config, timeoutContext);
+    await config.onProgress?.({ stage: "relay_request", hostname: request.certificateRequest.hostname });
+    response = await runSwitchboardCertificateStage(timeoutContext, "relay_request", request.certificateRequest.hostname, (signal) =>
+      fetchImpl(new URL("/v1/certificates", relayUrl), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        signal,
+        body: JSON.stringify({
+          certificateRequest: request.certificateRequest,
+          csrPem: request.csrPem,
+          signature: request.signature
+        })
+      })
+    );
+  } finally {
+    clearSwitchboardCertificateTimeoutContext(timeoutContext);
+  }
   const relayResponse = await responseJsonOrText(response) as SwitchboardCertificateResult["relayResponse"];
   if (!response.ok) {
     throw new SwitchboardCertificateError(
@@ -2148,6 +2255,9 @@ function switchboardCertificateErrorDetails(error: SwitchboardCertificateError):
     stage: error.stage,
     error: safeCertificateError(error)
   };
+  if (error.details) {
+    Object.assign(details, error.details);
+  }
   if (error.hostname) {
     details.hostname = error.hostname;
   }
@@ -2165,13 +2275,126 @@ function switchboardCertificateErrorDetails(error: SwitchboardCertificateError):
 }
 
 function safeCertificateError(error: SwitchboardCertificateError): Record<string, unknown> {
-  return {
+  const details: Record<string, unknown> = {
     name: error.name,
     message: error.message,
     stage: error.stage,
     hostname: error.hostname,
     status: error.status
   };
+  if (error.details) {
+    details.details = error.details;
+  }
+  return details;
+}
+
+interface SwitchboardCertificateTimeoutContext {
+  controller: AbortController;
+  signal: AbortSignal;
+  timeout: ReturnType<typeof setTimeout>;
+  timeoutMs: number;
+  timedOut: boolean;
+}
+
+function createSwitchboardCertificateTimeoutContext(timeoutMs: number): SwitchboardCertificateTimeoutContext {
+  const controller = new AbortController();
+  const context: SwitchboardCertificateTimeoutContext = {
+    controller,
+    signal: controller.signal,
+    timeout: undefined as unknown as ReturnType<typeof setTimeout>,
+    timeoutMs,
+    timedOut: false
+  };
+  context.timeout = setTimeout(() => {
+    context.timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  return context;
+}
+
+function clearSwitchboardCertificateTimeoutContext(context: SwitchboardCertificateTimeoutContext): void {
+  clearTimeout(context.timeout);
+}
+
+async function runSwitchboardCertificateStage<T>(
+  context: SwitchboardCertificateTimeoutContext,
+  stage: SwitchboardCertificateFailureStage,
+  hostname: string | undefined,
+  work: (signal: AbortSignal) => Promise<T>
+): Promise<T> {
+  try {
+    return await new Promise<T>((resolve, reject) => {
+      if (context.signal.aborted) {
+        reject(switchboardCertificateTimeoutError(context, stage, hostname));
+        return;
+      }
+      const onAbort = () => reject(switchboardCertificateTimeoutError(context, stage, hostname));
+      context.signal.addEventListener("abort", onAbort, { once: true });
+      Promise.resolve()
+        .then(() => work(context.signal))
+        .then(resolve, reject)
+        .finally(() => context.signal.removeEventListener("abort", onAbort));
+    });
+  } catch (error) {
+    if (context.timedOut && isAbortError(error)) {
+      throw switchboardCertificateTimeoutError(context, stage, hostname, error);
+    }
+    throw error;
+  }
+}
+
+function switchboardCertificateTimeoutError(
+  context: SwitchboardCertificateTimeoutContext,
+  stage: SwitchboardCertificateFailureStage,
+  hostname: string | undefined,
+  cause?: unknown
+): SwitchboardCertificateError {
+  const suffix = hostname ? ` for ${hostname}` : "";
+  return new SwitchboardCertificateError(
+    `Switchboard certificate request timed out during ${stage}${suffix} after ${context.timeoutMs}ms`,
+    {
+      stage,
+      hostname,
+      relayResponse: {
+        error: "certificate_request_timeout",
+        stage,
+        timeoutMs: context.timeoutMs
+      },
+      details: {
+        timeoutMs: context.timeoutMs,
+        timeoutStage: stage
+      },
+      cause
+    }
+  );
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
+}
+
+function normalizeSwitchboardCertificateKeyAlgorithm(
+  value: unknown,
+  hostname?: string
+): SwitchboardCertificateKeyAlgorithm {
+  if (value === undefined || value === null || value === "") {
+    return "ecdsa-p256";
+  }
+  if (value === "ecdsa-p256" || value === "rsa-2048") {
+    return value;
+  }
+  const certificateKeyAlgorithm = String(value);
+  throw new SwitchboardCertificateError(
+    `Invalid Switchboard certificate key algorithm ${JSON.stringify(certificateKeyAlgorithm)}; expected ecdsa-p256 or rsa-2048`,
+    {
+      stage: "certificate_config",
+      hostname,
+      details: {
+        certificateKeyAlgorithm,
+        validCertificateKeyAlgorithms: ["ecdsa-p256", "rsa-2048"]
+      }
+    }
+  );
 }
 
 function certificateFailureStageForRelayResponse(
@@ -2226,6 +2449,11 @@ function numberConfig(runtime: SwitchboardRuntime, name: string, fallback: numbe
   }
   const parsed = Number(raw);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function certificateKeyAlgorithmConfig(runtime: SwitchboardRuntime): SwitchboardCertificateKeyAlgorithm {
+  const value = runtime.configValue("SWITCHBOARD_CERTIFICATE_KEY_ALGORITHM")?.trim().toLowerCase();
+  return normalizeSwitchboardCertificateKeyAlgorithm(value);
 }
 
 function requiredRuntimeConfig(value: string | undefined, name: string): string {

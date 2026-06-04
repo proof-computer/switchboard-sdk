@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createPrivateKey } from "node:crypto";
 import { describe, it } from "node:test";
 
 import { SwitchboardControlPlaneClient } from "../dist/control-plane.js";
@@ -10,11 +11,13 @@ import {
 import {
   GATEWAY_UPSTREAM_OBSERVATION_DOMAIN,
   createEncryptedSwitchboardLogger,
+  createSwitchboardCertificateSigningRequest,
   createSwitchboardRuntime,
   generateProofLogEncryptionKey,
   pollCustomerHostnameAuthorizationsWithRelay,
   registerIngressWithRelay,
-  requestCertificateWithRelay
+  requestCertificateWithRelay,
+  SwitchboardCertificateError
 } from "../dist/index.js";
 
 const SIGNATURE = `0x${"11".repeat(65)}`;
@@ -226,6 +229,96 @@ describe("Switchboard SDK transport security", () => {
       () => runtime.admitGatewayUpstream(),
       /Switchboard gateway upstream admission URL must use https:\/\//
     );
+    assert.equal(fetchImpl.calls.length, 0);
+  });
+
+  it("uses ECDSA CSRs by default and reports certificate request progress before fetch", async () => {
+    const progress = [];
+    const result = await requestCertificateWithRelay(
+      {
+        ...certificateConfig("https://relay.example.test"),
+        csrPem: undefined,
+        privateKeyPem: undefined,
+        onProgress: (event) => progress.push(event)
+      },
+      recordingFetch({ certificatePem: "cert", issuer: "unit-test" })
+    );
+
+    assert.equal(createPrivateKey(result.privateKeyPem).asymmetricKeyType, "ec");
+    assert.deepEqual(progress.map((event) => event.stage), ["csr_generation", "request_signing", "relay_request"]);
+    assert.deepEqual(progress.map((event) => event.hostname), [
+      "demo.example.com",
+      "demo.example.com",
+      "demo.example.com"
+    ]);
+  });
+
+  it("keeps rsa-2048 as an explicit CSR escape hatch", async () => {
+    const csr = await createSwitchboardCertificateSigningRequest("demo.example.com", {
+      keyAlgorithm: "rsa-2048"
+    });
+
+    assert.equal(createPrivateKey(csr.privateKeyPem).asymmetricKeyType, "rsa");
+  });
+
+  it("rejects invalid certificate key algorithms before relay fetch", async () => {
+    const fetchImpl = recordingFetch({ certificatePem: "cert", issuer: "unit-test" });
+
+    await assert.rejects(
+      () => requestCertificateWithRelay(
+        {
+          ...certificateConfig("https://relay.example.test"),
+          csrPem: undefined,
+          privateKeyPem: undefined,
+          certificateKeyAlgorithm: "ed25519"
+        },
+        fetchImpl
+      ),
+      (error) => {
+        assert.ok(error instanceof SwitchboardCertificateError);
+        assert.equal(error.stage, "certificate_config");
+        assert.equal(error.hostname, "demo.example.com");
+        assert.equal(error.details?.certificateKeyAlgorithm, "ed25519");
+        return true;
+      }
+    );
+    assert.equal(fetchImpl.calls.length, 0);
+  });
+
+  it("uses one certificate request timeout budget before relay fetch", async () => {
+    const fetchImpl = recordingFetch({ certificatePem: "cert", issuer: "unit-test" });
+    const progress = [];
+
+    await assert.rejects(
+      () => requestCertificateWithRelay(
+        {
+          ...certificateConfig("https://relay.example.test"),
+          jobSigner: {
+            async getAddress() {
+              return JOB_SIGNER;
+            },
+            async signRegistration() {
+              return SIGNATURE;
+            },
+            async signCertificateRequest() {
+              return new Promise(() => undefined);
+            }
+          },
+          requestTimeoutMs: 5,
+          onProgress: (event) => progress.push(event)
+        },
+        fetchImpl
+      ),
+      (error) => {
+        assert.ok(error instanceof SwitchboardCertificateError);
+        assert.equal(error.stage, "request_signing");
+        assert.equal(error.hostname, "demo.example.com");
+        assert.equal(error.details?.timeoutMs, 5);
+        assert.equal(error.relayResponse?.error, "certificate_request_timeout");
+        return true;
+      }
+    );
+    assert.deepEqual(progress.map((event) => event.stage), ["request_signing"]);
     assert.equal(fetchImpl.calls.length, 0);
   });
 });

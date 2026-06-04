@@ -8,14 +8,14 @@ published on npmjs.com yet.
 ## Install
 
 ```sh
-npm install github:proof-computer/switchboard-sdk#v0.1.2
+npm install github:proof-computer/switchboard-sdk#v0.1.4
 ```
 
 Framework apps usually install one adapter instead:
 
 ```sh
-npm install github:proof-computer/switchboard-express#v0.1.0 express
-npm install github:proof-computer/switchboard-fastify#v0.1.0 fastify
+npm install github:proof-computer/switchboard-express#v0.1.3 express
+npm install github:proof-computer/switchboard-fastify#v0.1.4 fastify
 ```
 
 Use `#main` only when intentionally testing unreleased changes. npmjs.com
