@@ -245,8 +245,9 @@ describe("Switchboard SDK transport security", () => {
     );
 
     assert.equal(createPrivateKey(result.privateKeyPem).asymmetricKeyType, "ec");
-    assert.deepEqual(progress.map((event) => event.stage), ["csr_generation", "request_signing", "relay_request"]);
+    assert.deepEqual(progress.map((event) => event.stage), ["csr_generation", "request_signing", "relay_request", "relay_response"]);
     assert.deepEqual(progress.map((event) => event.hostname), [
+      "demo.example.com",
       "demo.example.com",
       "demo.example.com",
       "demo.example.com"

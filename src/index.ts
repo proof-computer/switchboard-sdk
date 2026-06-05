@@ -44,6 +44,9 @@ type SwitchboardIntentHealthState =
   | "registering"
   | "registered"
   | "certificate_requesting"
+  | "certificate_received"
+  | "certificate_installing"
+  | "certificate_installed"
   | "ready"
   | "failed";
 
@@ -195,7 +198,7 @@ export interface SwitchboardCertificateConfig {
 
 export type SwitchboardCertificateKeyAlgorithm = "ecdsa-p256" | "rsa-2048";
 
-export type SwitchboardCertificateRequestProgressStage = "csr_generation" | "request_signing" | "relay_request";
+export type SwitchboardCertificateRequestProgressStage = "csr_generation" | "request_signing" | "relay_request" | "relay_response";
 
 export interface SwitchboardCertificateRequestProgress {
   stage: SwitchboardCertificateRequestProgressStage;
@@ -292,6 +295,7 @@ export type SwitchboardCertificateFailureStage =
   | "csr_generation"
   | "request_signing"
   | "relay_request"
+  | "certificate_install"
   | "certificate_authorization"
   | "acme_issuance"
   | "relay_response";
@@ -1004,6 +1008,13 @@ export class SwitchboardRuntime {
               relayResponse: result.relayResponse
             });
           }
+          await this.reportIntentHealth("certificate_received", {
+            attempt,
+            hostname,
+            issuer: typeof result.relayResponse.issuer === "string" ? result.relayResponse.issuer : undefined,
+            notAfter: typeof result.relayResponse.notAfter === "string" ? result.relayResponse.notAfter : undefined,
+            ...certificateRequestDetails
+          }).catch(() => undefined);
           certificates.push({
             hostname,
             cert,
@@ -1177,18 +1188,38 @@ export class SwitchboardRuntime {
   private addManagedCertificate(certificate: SwitchboardManagedCertificate): boolean {
     const hostname = normalizeHostname(certificate.hostname);
     const existingIndex = this.managedCertificates.findIndex((item) => normalizeHostname(item.hostname) === hostname);
+    void this.reportIntentHealthBestEffort("certificate_installing", {
+      hostname,
+      issuer: certificate.issuer,
+      notAfter: certificate.notAfter
+    });
+    let context: SecureContext;
+    try {
+      context = tls.createSecureContext({
+        cert: certificate.cert,
+        key: certificate.key
+      });
+    } catch (error) {
+      const certificateError = new SwitchboardCertificateError(`Failed to install Switchboard TLS certificate for ${hostname}: ${safeErrorMessage(error)}`, {
+        stage: "certificate_install",
+        hostname,
+        details: safeError(error),
+        cause: error
+      });
+      void this.reportIntentHealthBestEffort("failed", switchboardCertificateErrorDetails(certificateError));
+      throw certificateError;
+    }
     if (existingIndex >= 0) {
       this.managedCertificates[existingIndex] = certificate;
     } else {
       this.managedCertificates.push(certificate);
     }
-    this.managedCertificateContexts.set(
+    this.managedCertificateContexts.set(hostname, context);
+    void this.reportIntentHealthBestEffort("certificate_installed", {
       hostname,
-      tls.createSecureContext({
-        cert: certificate.cert,
-        key: certificate.key
-      })
-    );
+      issuer: certificate.issuer,
+      notAfter: certificate.notAfter
+    });
     return existingIndex < 0;
   }
 
@@ -1780,6 +1811,7 @@ export async function requestCertificateWithRelay(
     clearSwitchboardCertificateTimeoutContext(timeoutContext);
   }
   const relayResponse = await responseJsonOrText(response) as SwitchboardCertificateResult["relayResponse"];
+  await config.onProgress?.({ stage: "relay_response", hostname: request.certificateRequest.hostname });
   if (!response.ok) {
     throw new SwitchboardCertificateError(
       `Relay certificate request failed for ${normalizeHostname(config.hostname)}: ${response.status} ${JSON.stringify(relayResponse)}`,
@@ -1919,13 +1951,25 @@ export function tlsOptionsForManagedCertificates(certificates: SwitchboardManage
     return undefined;
   }
   const contexts = new Map(
-    certificates.map((certificate) => [
-      normalizeHostname(certificate.hostname),
-      tls.createSecureContext({
-        cert: certificate.cert,
-        key: certificate.key
-      })
-    ])
+    certificates.map((certificate) => {
+      const hostname = normalizeHostname(certificate.hostname);
+      try {
+        return [
+          hostname,
+          tls.createSecureContext({
+            cert: certificate.cert,
+            key: certificate.key
+          })
+        ] as const;
+      } catch (error) {
+        throw new SwitchboardCertificateError(`Failed to install Switchboard TLS certificate for ${hostname}: ${safeErrorMessage(error)}`, {
+          stage: "certificate_install",
+          hostname,
+          details: safeError(error),
+          cause: error
+        });
+      }
+    })
   );
   const defaultCertificate = certificates[0]!;
   const defaultContext = contexts.get(normalizeHostname(defaultCertificate.hostname));
@@ -2559,6 +2603,10 @@ function safeError(error: unknown): Record<string, unknown> {
     return details;
   }
   return { message: String(error) };
+}
+
+function safeErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function safeUrlHost(value: string): string | undefined {
