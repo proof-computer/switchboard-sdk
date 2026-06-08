@@ -34,6 +34,7 @@ export const PROOF_INGRESS_STATUS_PATH = SWITCHBOARD_STATUS_PATH;
 export const EIP712_DOMAIN_NAME = "ProofIngress";
 export const EIP712_DOMAIN_VERSION = "1";
 const DEFAULT_SWITCHBOARD_INTENT_REQUEST_TIMEOUT_MS = 60_000;
+const DEFAULT_CERTIFICATE_ACTIVATION_DEADLINE_SAFETY_MS = 60_000;
 
 type SwitchboardIntentHealthState =
   | "starting"
@@ -298,6 +299,7 @@ export type SwitchboardCertificateFailureStage =
   | "certificate_install"
   | "certificate_authorization"
   | "acme_issuance"
+  | "activation_deadline"
   | "relay_response";
 
 export interface SwitchboardCertificateErrorOptions {
@@ -337,6 +339,7 @@ export interface SwitchboardRuntimeConfig {
   processorId?: string;
   gatewayId?: string;
   gatewayUpstreamAdmissionUrl?: string;
+  activationDeadline?: string | number;
   endpointHostname?: string;
   certificateMode?: string;
   certificateHostnames?: string[];
@@ -470,6 +473,7 @@ export class SwitchboardRuntime {
   private readonly logEvent: (event: string, details?: Record<string, unknown>) => Promise<void>;
   private readonly managedCertificates: SwitchboardManagedCertificate[] = [];
   private readonly managedCertificateContexts = new Map<string, SecureContext>();
+  private readonly certificateSigningRequests = new Map<string, SwitchboardCertificateSigningRequest>();
   private gatewayUpstreamAdmission?: SwitchboardGatewayUpstreamAdmissionResult;
   private customerHostnamePollTimer?: NodeJS.Timeout;
   private customerHostnamePollActive = false;
@@ -877,6 +881,9 @@ export class SwitchboardRuntime {
       PROCESSOR_ID: requiredRuntimeConfig(config.processorId, "processorId"),
       GATEWAY_ID: config.gatewayId,
       GATEWAY_UPSTREAM_ADMISSION_URL: config.gatewayUpstreamAdmissionUrl,
+      SWITCHBOARD_SESSION_ACTIVATION_DEADLINE: config.activationDeadline === undefined
+        ? undefined
+        : String(config.activationDeadline),
       ENDPOINT_HOSTNAME: requiredRuntimeConfig(config.endpointHostname, "endpointHostname"),
       SWITCHBOARD_CERTIFICATE_MODE: config.certificateMode ?? "job-acme",
       SWITCHBOARD_CERTIFICATE_HOSTNAMES: (config.certificateHostnames ?? [config.endpointHostname]).filter(Boolean).join(",")
@@ -920,7 +927,7 @@ export class SwitchboardRuntime {
     }
     const retryMs = numberConfig(this, "SWITCHBOARD_CERTIFICATE_RETRY_MS", numberConfig(this, "SWITCHBOARD_REGISTRATION_RETRY_MS", 30_000));
     const maxAttempts = numberConfig(this, "SWITCHBOARD_CERTIFICATE_MAX_ATTEMPTS", 0);
-    const requestTimeoutMs = numberConfig(this, "SWITCHBOARD_CERTIFICATE_REQUEST_TIMEOUT_MS", 120_000);
+    const configuredRequestTimeoutMs = numberConfig(this, "SWITCHBOARD_CERTIFICATE_REQUEST_TIMEOUT_MS", 120_000);
     let certificateKeyAlgorithm: SwitchboardCertificateKeyAlgorithm;
     try {
       certificateKeyAlgorithm = certificateKeyAlgorithmConfig(this);
@@ -933,7 +940,7 @@ export class SwitchboardRuntime {
         attempt: 1,
         maxAttempts,
         hostnames,
-        requestTimeoutMs,
+        requestTimeoutMs: configuredRequestTimeoutMs,
         retryExhausted: true,
         ...errorDetails
       });
@@ -941,26 +948,38 @@ export class SwitchboardRuntime {
         attempt: 1,
         maxAttempts,
         hostnames,
-        requestTimeoutMs,
+        requestTimeoutMs: configuredRequestTimeoutMs,
         retryExhausted: true,
         ...errorDetails
       }).catch(() => undefined);
       throw certificateError;
     }
-    const certificateRequestDetails = {
+    const signer = await this.jobSigner();
+    const runtimeSigner = await signer.signer.getAddress();
+    const baseCertificateRequestDetails = {
       hostnames,
       certificateKeyAlgorithm,
-      requestTimeoutMs
+      configuredRequestTimeoutMs,
+      runtimeSigner,
+      activationDeadline: this.sessionActivationDeadlineString()
     };
 
     for (let attempt = 1; maxAttempts === 0 || attempt <= maxAttempts; attempt += 1) {
       try {
+        const exhaustedWindow = this.certificateActivationWindowExhausted();
+        if (exhaustedWindow) {
+          throw this.certificateActivationDeadlineError(exhaustedWindow);
+        }
+        const timing = this.certificateRequestTimingDetails(configuredRequestTimeoutMs);
+        const certificateRequestDetails = {
+          ...baseCertificateRequestDetails,
+          ...timing
+        };
         await this.reportIntentHealth("certificate_requesting", {
           attempt,
           stage: "certificate_request",
           ...certificateRequestDetails
         }).catch(() => undefined);
-        const signer = await this.jobSigner();
         const certificates: SwitchboardManagedCertificate[] = [];
         for (const hostname of hostnames) {
           await this.log("certificate-request-started", {
@@ -968,11 +987,20 @@ export class SwitchboardRuntime {
             hostname,
             hostnames,
             certificateKeyAlgorithm,
-            requestTimeoutMs,
+            requestTimeoutMs: timing.requestTimeoutMs,
+            configuredRequestTimeoutMs,
             endpointHostname: this.configValue("ENDPOINT_HOSTNAME"),
             relayHost: safeUrlHost(this.requiredConfig("RELAY_URL")),
             signerMode: signer.mode,
-            jobSigner: await signer.signer.getAddress()
+            jobSigner: runtimeSigner
+          });
+          const csr = await this.certificateSigningRequestForRetry({
+            attempt,
+            hostname,
+            sessionId: this.requiredConfig("SESSION_ID"),
+            runtimeSigner,
+            certificateKeyAlgorithm,
+            certificateRequestDetails
           });
           let result: SwitchboardCertificateResult;
           try {
@@ -982,8 +1010,10 @@ export class SwitchboardRuntime {
               registryAddress: this.requiredConfig("INGRESS_REGISTRY_ADDRESS"),
               sessionId: this.requiredConfig("SESSION_ID"),
               hostname,
+              csrPem: csr.csrPem,
+              privateKeyPem: csr.privateKeyPem,
               jobSigner: signer.signer,
-              requestTimeoutMs,
+              requestTimeoutMs: timing.requestTimeoutMs,
               certificateKeyAlgorithm,
               onProgress: (progress) =>
                 this.reportIntentHealth("certificate_requesting", {
@@ -1026,7 +1056,8 @@ export class SwitchboardRuntime {
         await this.log("certificate-issued", {
           attempt,
           certificateKeyAlgorithm,
-          requestTimeoutMs,
+          requestTimeoutMs: certificateRequestDetails.requestTimeoutMs,
+          configuredRequestTimeoutMs,
           hostnames: certificates.map((certificate) => certificate.hostname),
           certificates: certificates.map((certificate) => ({
             hostname: certificate.hostname,
@@ -1039,34 +1070,84 @@ export class SwitchboardRuntime {
         const certificateError = asSwitchboardCertificateError(error, {
           stage: "certificate_request"
         });
-        const retryable = certificateError.stage !== "certificate_config" && certificateError.stage !== "hostname_config";
-        const willRetry = retryable && (maxAttempts === 0 || attempt < maxAttempts);
         const retryAfterMs = certificateRetryAfterMs(certificateError);
         const nextRetryMs = retryAfterMs ?? retryMs;
-        const errorDetails = switchboardCertificateErrorDetails(certificateError);
+        const exhaustedBeforeRetry = this.certificateActivationWindowExhausted(Date.now() + nextRetryMs);
+        const blockedByActivationWindow = Boolean(exhaustedBeforeRetry && certificateError.stage !== "activation_deadline");
+        const finalError = blockedByActivationWindow
+          ? this.certificateActivationDeadlineError(exhaustedBeforeRetry!, certificateError.hostname, certificateError)
+          : certificateError;
+        const retryable =
+          finalError.stage !== "certificate_config" &&
+          finalError.stage !== "hostname_config" &&
+          finalError.stage !== "activation_deadline";
+        const willRetry = retryable && (maxAttempts === 0 || attempt < maxAttempts);
+        const errorDetails = switchboardCertificateErrorDetails(finalError);
+        const timing = this.certificateRequestTimingDetails(configuredRequestTimeoutMs);
         await this.log("certificate-request-failed", {
           attempt,
           maxAttempts,
-          ...certificateRequestDetails,
+          ...baseCertificateRequestDetails,
+          ...timing,
           retryMs: willRetry ? nextRetryMs : undefined,
           ...errorDetails
         });
         await this.reportIntentHealth(willRetry ? "certificate_requesting" : "failed", {
           attempt,
           maxAttempts,
-          ...certificateRequestDetails,
+          ...baseCertificateRequestDetails,
+          ...timing,
           retryMs: willRetry ? nextRetryMs : undefined,
           retryExhausted: !willRetry,
           ...errorDetails
         }).catch(() => undefined);
         if (!willRetry) {
-          throw certificateError;
+          throw finalError;
         }
         await sleep(nextRetryMs);
       }
     }
 
     return [];
+  }
+
+  private async certificateSigningRequestForRetry(input: {
+    attempt: number;
+    hostname: string;
+    sessionId: string;
+    runtimeSigner: string;
+    certificateKeyAlgorithm: SwitchboardCertificateKeyAlgorithm;
+    certificateRequestDetails: Record<string, unknown>;
+  }): Promise<SwitchboardCertificateSigningRequest> {
+    const hostname = normalizeHostname(input.hostname);
+    const cacheKey = certificateSigningRequestCacheKey(
+      input.sessionId,
+      hostname,
+      input.runtimeSigner,
+      input.certificateKeyAlgorithm
+    );
+    const cached = this.certificateSigningRequests.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+    await this.reportIntentHealth("certificate_requesting", {
+      attempt: input.attempt,
+      stage: "csr_generation",
+      hostname,
+      ...input.certificateRequestDetails
+    }).catch(() => undefined);
+    try {
+      const csr = await createSwitchboardCertificateSigningRequest(hostname, {
+        keyAlgorithm: input.certificateKeyAlgorithm
+      });
+      this.certificateSigningRequests.set(cacheKey, csr);
+      return csr;
+    } catch (error) {
+      throw asSwitchboardCertificateError(error, {
+        stage: "csr_generation",
+        hostname
+      });
+    }
   }
 
   async admitGatewayUpstream(): Promise<SwitchboardGatewayUpstreamAdmissionResult | undefined> {
@@ -1356,6 +1437,87 @@ export class SwitchboardRuntime {
     const configured = splitCsv(this.configValue("SWITCHBOARD_CERTIFICATE_HOSTNAMES") ?? "");
     const endpoint = this.configValue("ENDPOINT_HOSTNAME");
     return [...new Set((configured.length > 0 ? configured : endpoint ? [endpoint] : []).map(normalizeHostname).filter(Boolean))];
+  }
+
+  private sessionActivationDeadlineString(): string | undefined {
+    return this.configValue("SWITCHBOARD_SESSION_ACTIVATION_DEADLINE");
+  }
+
+  private certificateActivationWindowExhausted(nowMs = Date.now()): Record<string, unknown> | undefined {
+    const rawDeadline = this.sessionActivationDeadlineString();
+    if (!rawDeadline) {
+      return undefined;
+    }
+    const activationDeadlineSeconds = Number(rawDeadline);
+    if (!Number.isFinite(activationDeadlineSeconds) || activationDeadlineSeconds <= 0) {
+      return undefined;
+    }
+    const activationDeadlineMs = activationDeadlineSeconds * 1000;
+    const safetyMs = numberConfig(
+      this,
+      "SWITCHBOARD_CERTIFICATE_ACTIVATION_DEADLINE_SAFETY_MS",
+      DEFAULT_CERTIFICATE_ACTIVATION_DEADLINE_SAFETY_MS
+    );
+    const remainingMs = activationDeadlineMs - nowMs;
+    if (remainingMs > safetyMs) {
+      return undefined;
+    }
+    return {
+      reason: remainingMs <= 0 ? "activation_window_expired" : "activation_window_expiring",
+      activationDeadline: String(Math.floor(activationDeadlineSeconds)),
+      activationDeadlineIso: new Date(activationDeadlineMs).toISOString(),
+      remainingMs,
+      activationDeadlineRemainingMs: remainingMs,
+      safetyMs
+    };
+  }
+
+  private certificateRequestTimingDetails(configuredRequestTimeoutMs: number, nowMs = Date.now()): Record<string, unknown> & { requestTimeoutMs: number } {
+    const rawDeadline = this.sessionActivationDeadlineString();
+    if (!rawDeadline) {
+      return {
+        requestTimeoutMs: configuredRequestTimeoutMs
+      };
+    }
+    const activationDeadlineSeconds = Number(rawDeadline);
+    if (!Number.isFinite(activationDeadlineSeconds) || activationDeadlineSeconds <= 0) {
+      return {
+        requestTimeoutMs: configuredRequestTimeoutMs
+      };
+    }
+    const activationDeadlineMs = activationDeadlineSeconds * 1000;
+    const safetyMs = numberConfig(
+      this,
+      "SWITCHBOARD_CERTIFICATE_ACTIVATION_DEADLINE_SAFETY_MS",
+      DEFAULT_CERTIFICATE_ACTIVATION_DEADLINE_SAFETY_MS
+    );
+    const remainingMs = activationDeadlineMs - nowMs;
+    const requestWindowMs = Math.max(0, remainingMs - safetyMs);
+    return {
+      requestTimeoutMs: Math.max(1, Math.min(configuredRequestTimeoutMs, Math.floor(requestWindowMs))),
+      configuredRequestTimeoutMs,
+      activationDeadline: String(Math.floor(activationDeadlineSeconds)),
+      activationDeadlineIso: new Date(activationDeadlineMs).toISOString(),
+      activationDeadlineRemainingMs: remainingMs,
+      activationDeadlineSafetyMs: safetyMs,
+      activationDeadlineRequestWindowMs: requestWindowMs
+    };
+  }
+
+  private certificateActivationDeadlineError(
+    details: Record<string, unknown>,
+    hostname?: string,
+    lastError?: SwitchboardCertificateError
+  ): SwitchboardCertificateError {
+    return new SwitchboardCertificateError("Switchboard certificate request stopped because the session activation window is exhausted", {
+      stage: "activation_deadline",
+      hostname,
+      details: {
+        ...details,
+        lastError: lastError ? switchboardCertificateErrorDetails(lastError) : undefined
+      },
+      cause: lastError
+    });
   }
 
   private requiredConfig(name: string): string {
@@ -1795,18 +1957,41 @@ export async function requestCertificateWithRelay(
   try {
     request = await buildIngressCertificateRequestWithContext(config, timeoutContext);
     await config.onProgress?.({ stage: "relay_request", hostname: request.certificateRequest.hostname });
-    response = await runSwitchboardCertificateStage(timeoutContext, "relay_request", request.certificateRequest.hostname, (signal) =>
-      fetchImpl(new URL("/v1/certificates", relayUrl), {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        signal,
-        body: JSON.stringify({
-          certificateRequest: request.certificateRequest,
-          csrPem: request.csrPem,
-          signature: request.signature
+    try {
+      response = await runSwitchboardCertificateStage(timeoutContext, "relay_request", request.certificateRequest.hostname, (signal) =>
+        fetchImpl(new URL("/v1/certificates", relayUrl), {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          signal,
+          body: JSON.stringify({
+            certificateRequest: request.certificateRequest,
+            csrPem: request.csrPem,
+            signature: request.signature
+          })
         })
-      })
-    );
+      );
+    } catch (error) {
+      if (error instanceof SwitchboardCertificateError) {
+        throw error;
+      }
+      const hostname = request.certificateRequest.hostname;
+      throw new SwitchboardCertificateError(
+        `Relay certificate request failed for ${hostname}: ${safeErrorMessage(error)}`,
+        {
+          stage: "relay_request",
+          hostname,
+          relayResponse: {
+            error: "runtime_fetch_aborted",
+            classification: "runtime_fetch_aborted"
+          },
+          details: {
+            classification: "runtime_fetch_aborted",
+            error: safeError(error)
+          },
+          cause: error
+        }
+      );
+    }
   } finally {
     clearSwitchboardCertificateTimeoutContext(timeoutContext);
   }
@@ -2459,6 +2644,20 @@ function certificateFailureStageForRelayResponse(
     return "hostname_config";
   }
   return "relay_response";
+}
+
+function certificateSigningRequestCacheKey(
+  sessionId: string,
+  hostname: string,
+  runtimeSigner: string,
+  keyAlgorithm: SwitchboardCertificateKeyAlgorithm
+): string {
+  return [
+    String(sessionId).toLowerCase(),
+    normalizeHostname(hostname),
+    String(runtimeSigner).toLowerCase(),
+    keyAlgorithm
+  ].join("\n");
 }
 
 function certificateRetryAfterMs(error: SwitchboardCertificateError): number | undefined {
